@@ -1,0 +1,13 @@
+{
+  "name": "three-sites-playwright-qa",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daily Playwright QA for pl168.net, jf1688.com.tw, and firstloan.tw",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}
