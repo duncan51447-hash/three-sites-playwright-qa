@@ -115,10 +115,42 @@ async function checkPage(page: Page, url: string, errors: string[]) {
       const control = safeControls.nth(index);
       const text = ((await control.innerText().catch(() => '')) || '').trim();
       if (/送出|申請|預約|聯絡|撥打|電話|LINE|submit|send|apply|delete|remove/i.test(text)) continue;
+
+      const beforeClickUrl = page.url();
       try {
         await control.click({ timeout: 3_000 });
+        await page.waitForTimeout(500);
+
+        if (page.url() !== beforeClickUrl) {
+          const returned = await page.goBack({
+            waitUntil: 'domcontentloaded',
+            timeout: 10_000
+          }).catch(() => null);
+
+          if (!returned && page.url() !== beforeClickUrl) {
+            await page.goto(beforeClickUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 30_000
+            });
+          }
+          await page.waitForLoadState('domcontentloaded').catch(() => {});
+        }
+
         await page.keyboard.press('Escape').catch(() => {});
       } catch (error) {
+        if (page.url() !== beforeClickUrl) {
+          await page.goBack({
+            waitUntil: 'domcontentloaded',
+            timeout: 10_000
+          }).catch(async () => {
+            await page.goto(beforeClickUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 30_000
+            }).catch(() => {});
+          });
+          continue;
+        }
+
         errors.push(`INTERACTION_FAILED | ${url} | ${text || `control-${index + 1}`} | ${String(error)}`);
       }
     }
