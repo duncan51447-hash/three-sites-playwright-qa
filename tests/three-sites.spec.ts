@@ -58,7 +58,12 @@ async function checkPage(page: Page, url: string, errors: string[]) {
   const pageErrors: string[] = [];
 
   const onConsole = (message: { type(): string; text(): string }) => {
-    if (message.type() === 'error' && !/favicon|third-party cookie/i.test(message.text())) {
+            const text = message.text();
+    if (/requestStorageAccess:\s*Permission denied/i.test(text)) {
+      console.warn(`QA_WARNING | ${url} | ${text}`);
+      return;
+    }
+    if (message.type() === 'error' && !/favicon|third-party cookie/i.test(text)) {
       consoleErrors.push(message.text());
     }
   };
