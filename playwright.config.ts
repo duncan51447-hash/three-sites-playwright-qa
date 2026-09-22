@@ -16,6 +16,9 @@ export default defineConfig({
     ignoreHTTPSErrors: true,
     navigationTimeout: 30_000,
     actionTimeout: 10_000,
+    launchOptions: {
+      slowMo: 3_000
+    },
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
     video: 'retain-on-failure'
