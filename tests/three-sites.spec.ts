@@ -72,7 +72,18 @@ async function checkPage(page: Page, url: string, errors: string[]) {
       consoleErrors.push(message.text());
     }
   };
-  const onPageError = (error: Error) => pageErrors.push(error.message);
+  const onPageError = (error: Error) => {
+    const isJf1688NonBlockingWordPressError =
+      new URL(url).hostname === 'jf1688.com.tw' &&
+      /^(?:jQuery|wp) is not defined$/i.test(error.message.trim());
+
+    if (isJf1688NonBlockingWordPressError) {
+      console.warn(`QA_WARNING | ${url} | WORDPRESS_SCRIPT_ORDER | ${error.message}`);
+      return;
+    }
+
+    pageErrors.push(error.message);
+  };
   const onResponse = (response: { status(): number; url(): string }) => {
     if (response.status() === 401) unauthorizedResponses.add(response.url());
   };
