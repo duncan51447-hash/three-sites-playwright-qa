@@ -56,6 +56,7 @@ async function collectSitemapUrls(
 async function checkPage(page: Page, url: string, errors: string[]) {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
+  const unauthorizedResponses = new Set<string>();
 
   const onConsole = (message: { type(): string; text(): string }) => {
             const text = message.text();
@@ -63,14 +64,22 @@ async function checkPage(page: Page, url: string, errors: string[]) {
       console.warn(`QA_WARNING | ${url} | ${text}`);
       return;
     }
+    if (/Failed to load resource:.*status of 401/i.test(text)) {
+      console.warn(`QA_WARNING | ${url} | 401 resource detected; exact URL recorded from the response event`);
+      return;
+    }
     if (message.type() === 'error' && !/favicon|third-party cookie/i.test(text)) {
       consoleErrors.push(message.text());
     }
   };
   const onPageError = (error: Error) => pageErrors.push(error.message);
+  const onResponse = (response: { status(): number; url(): string }) => {
+    if (response.status() === 401) unauthorizedResponses.add(response.url());
+  };
 
   page.on('console', onConsole);
   page.on('pageerror', onPageError);
+  page.on('response', onResponse);
 
   try {
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
@@ -169,8 +178,19 @@ async function checkPage(page: Page, url: string, errors: string[]) {
   } catch (error) {
     errors.push(`NAVIGATION_FAILED | ${url} | ${String(error)}`);
   } finally {
+    const pageOrigin = new URL(url).origin;
+    for (const resourceUrl of unauthorizedResponses) {
+      const finding = `HTTP_401_RESOURCE | ${url} | ${resourceUrl}`;
+      try {
+        if (new URL(resourceUrl).origin === pageOrigin) errors.push(finding);
+        else console.warn(`QA_WARNING | ${finding}`);
+      } catch {
+        errors.push(finding);
+      }
+    }
     page.off('console', onConsole);
     page.off('pageerror', onPageError);
+    page.off('response', onResponse);
   }
 }
 
