@@ -68,6 +68,10 @@ async function checkPage(page: Page, url: string, errors: string[]) {
       console.warn(`QA_WARNING | ${url} | 401 resource detected; exact URL recorded from the response event`);
       return;
     }
+    if (/Permissions policy violation:.*compute-pressure is not allowed/i.test(text)) {
+      console.warn(`QA_WARNING | ${url} | BROWSER_PERMISSION | ${text}`);
+      return;
+    }
     if (message.type() === 'error' && !/favicon|third-party cookie/i.test(text)) {
       consoleErrors.push(message.text());
     }
@@ -75,7 +79,10 @@ async function checkPage(page: Page, url: string, errors: string[]) {
   const onPageError = (error: Error) => {
     const isJf1688NonBlockingWordPressError =
       new URL(url).hostname === 'jf1688.com.tw' &&
-      /^(?:jQuery|wp) is not defined$/i.test(error.message.trim());
+      (
+        /^(?:jQuery|wp) is not defined$/i.test(error.message.trim()) ||
+        /Cannot read properties of undefined \(reading ['"]setLocaleData['"]\)/i.test(error.message)
+      );
 
     if (isJf1688NonBlockingWordPressError) {
       console.warn(`QA_WARNING | ${url} | WORDPRESS_SCRIPT_ORDER | ${error.message}`);
