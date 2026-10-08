@@ -9,6 +9,45 @@ const SITES = [
 const decodeXml = (value: string) =>
   value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
+async function browseLikeAVisitor(page: Page, url: string, errors: string[]) {
+  // Let banners, fonts, lazy-loaded images and third-party widgets settle as they
+  // would while a visitor reads the first screen.
+  await page.waitForTimeout(900);
+
+  const viewportHeight = page.viewportSize()?.height ?? 800;
+  const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+  const scrollableDistance = Math.max(0, pageHeight - viewportHeight);
+  const step = Math.max(280, Math.round(viewportHeight * 0.72));
+  const steps = Math.min(12, Math.max(1, Math.ceil(scrollableDistance / step)));
+
+  for (let index = 0; index < steps; index++) {
+    // Wheel scrolling also exercises scroll listeners, sticky headers and lazy loading.
+    await page.mouse.wheel(0, step);
+    await page.waitForTimeout(450 + (index % 3) * 170);
+
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth > document.documentElement.clientWidth + 2
+    );
+    if (overflow) {
+      errors.push(`HORIZONTAL_OVERFLOW_WHILE_SCROLLING | ${url} | step-${index + 1}`);
+      break;
+    }
+
+    // People commonly scroll back slightly after passing a section they want to reread.
+    if (index === 2 && steps > 4) {
+      await page.mouse.wheel(0, -Math.round(viewportHeight * 0.28));
+      await page.waitForTimeout(550);
+    }
+  }
+
+  await page.waitForTimeout(700);
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
+  await page.waitForTimeout(500);
+
+  const returnedToTop = await page.evaluate(() => window.scrollY <= 10);
+  if (!returnedToTop) errors.push(`SCROLL_RETURN_FAILED | ${url}`);
+}
+
 async function collectSitemapUrls(
   request: APIRequestContext,
   baseUrl: string
@@ -100,6 +139,8 @@ async function checkPage(page: Page, url: string, errors: string[]) {
     await expect(page.locator('body')).toBeVisible();
     const title = (await page.title()).trim();
     if (!title) errors.push(`EMPTY_TITLE | ${url}`);
+
+    await browseLikeAVisitor(page, url, errors);
 
     const brokenImages = await page.locator('img:visible').evaluateAll((images) =>
       images
