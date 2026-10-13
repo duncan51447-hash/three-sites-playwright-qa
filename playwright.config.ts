@@ -17,7 +17,9 @@ export default defineConfig({
     navigationTimeout: 30_000,
     actionTimeout: 10_000,
     launchOptions: {
-      slowMo: 3_000
+      // Reading/scrolling pauses live in the test itself. A small action delay
+      // keeps clicks human-like without multiplying a full-site audit by hours.
+      slowMo: 120
     },
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',

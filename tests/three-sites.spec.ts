@@ -1,5 +1,11 @@
 import { test, expect, APIRequestContext, Page } from '@playwright/test';
 
+type ClickAudit = {
+  discovered: number;
+  clicked: number;
+  excluded: string[];
+};
+
 const SITES = [
   { name: '龐德隆', baseUrl: 'https://www.pl168.net' },
   { name: '宅立貸', baseUrl: 'https://jf1688.com.tw' },
@@ -92,7 +98,150 @@ async function collectSitemapUrls(
   return [...discovered].sort();
 }
 
-async function checkPage(page: Page, url: string, errors: string[]) {
+const CLICKABLE_SELECTOR = [
+  'a[href]',
+  'button',
+  'input[type="button"]',
+  'input[type="reset"]',
+  'input[type="submit"]',
+  '[role="button"]',
+  '[role="link"]',
+  '[aria-expanded]',
+  'summary',
+  '[onclick]',
+  '[tabindex]:not([tabindex="-1"])'
+].join(', ');
+
+async function auditClickableElements(
+  page: Page,
+  url: string,
+  errors: string[],
+  audit: ClickAudit
+) {
+  // Mark the current DOM so each control can be reacquired after other clicks change
+  // the layout. Newly revealed controls (for example a mobile menu) are appended below.
+  const known = new Set<string>();
+  const queue: string[] = [];
+
+  const discoverVisibleControls = async () => {
+    const discovered = await page.locator(CLICKABLE_SELECTOR).evaluateAll((elements) => {
+      const results: { id: string; label: string; href: string; tag: string; type: string }[] = [];
+      for (const [index, element] of (elements as HTMLElement[]).entries()) {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const visible = style.display !== 'none' && style.visibility !== 'hidden' &&
+          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+        if (!visible || element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') continue;
+
+        // The DOM index is stable after returning to the same page, unlike a
+        // monotonically allocated id which would be lost on navigation.
+        const qaId = `qa-${index}`;
+        element.dataset.qaClickId = qaId;
+        const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
+        results.push({
+          id: qaId,
+          label: (element.innerText || element.getAttribute('aria-label') || element.getAttribute('title') ||
+            (element as HTMLInputElement).value || anchor?.href || element.tagName).trim().replace(/\s+/g, ' ').slice(0, 180),
+          href: anchor?.href || '',
+          tag: element.tagName.toLowerCase(),
+          type: (element.getAttribute('type') || '').toLowerCase()
+        });
+      }
+      return results;
+    });
+
+    for (const item of discovered) {
+      if (known.has(item.id)) continue;
+      known.add(item.id);
+      audit.discovered++;
+      queue.push(JSON.stringify(item));
+    }
+  };
+
+  await discoverVisibleControls();
+
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const item = JSON.parse(queue[cursor]) as {
+      id: string; label: string; href: string; tag: string; type: string;
+    };
+    const description = item.label || `${item.tag}-${cursor + 1}`;
+    const unsafeProtocol = /^(?:tel|mailto|sms):/i.test(item.href);
+    const externalCommunication = /(?:line\.me|lin\.ee|m\.me|messenger\.com|wa\.me)/i.test(item.href);
+    const sideEffectText = /送出|提交|立即申請|免費申請|預約|撥打|電話|加好友|加入好友|聯絡我們|付款|購買|刪除|移除|submit|send|apply|delete|remove|pay|checkout/i.test(description);
+    const submitControl = item.type === 'submit';
+
+    if (unsafeProtocol || externalCommunication || submitControl || sideEffectText) {
+      audit.excluded.push(`${url} | ${description} | ${item.href || item.type || 'potential side effect'}`);
+      continue;
+    }
+
+    let control = page.locator(`[data-qa-click-id="${item.id}"]`).first();
+    if (!(await control.count())) {
+      await discoverVisibleControls();
+      control = page.locator(`[data-qa-click-id="${item.id}"]`).first();
+    }
+    if (!(await control.count())) {
+      errors.push(`INTERACTION_NOT_REACQUIRED | ${url} | ${description}`);
+      continue;
+    }
+
+    const beforeUrl = page.url();
+    let popup: Page | null = null;
+    try {
+      await control.scrollIntoViewIfNeeded({ timeout: 5_000 });
+      await page.waitForTimeout(250);
+
+      // Keep ordinary links in a new tab. This is still a real browser click,
+      // while preserving the source DOM so every remaining control is tested.
+      if (item.href) {
+        await control.evaluate((element) => {
+          const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
+          if (anchor) anchor.target = '_blank';
+        });
+      }
+      const popupPromise = item.href
+        ? page.waitForEvent('popup', { timeout: 5_000 }).catch(() => null)
+        : Promise.resolve(null);
+      await control.click({ timeout: 5_000 });
+      popup = await popupPromise;
+      audit.clicked++;
+
+      if (popup) {
+        await popup.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
+        const popupUrl = popup.url();
+        const popupResponse = await popup.request.get(popupUrl, { timeout: 15_000 }).catch(() => null);
+        if (popupResponse && popupResponse.status() >= 400) {
+          errors.push(`CLICK_TARGET_HTTP_${popupResponse.status()} | ${url} | ${description} | ${popupUrl}`);
+        }
+        await popup.close().catch(() => {});
+      } else {
+        await page.waitForTimeout(650);
+        const afterUrl = page.url();
+        if (afterUrl !== beforeUrl) {
+          const response = await page.request.get(afterUrl, { timeout: 15_000 }).catch(() => null);
+          if (response && response.status() >= 400) {
+            errors.push(`CLICK_TARGET_HTTP_${response.status()} | ${url} | ${description} | ${afterUrl}`);
+          }
+          await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(async () => {
+            await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          });
+        } else {
+          // A menu, accordion, tab or modal may expose more clickable controls.
+          await discoverVisibleControls();
+          await page.keyboard.press('Escape').catch(() => {});
+        }
+      }
+    } catch (error) {
+      errors.push(`INTERACTION_FAILED | ${url} | ${description} | ${String(error)}`);
+      if (popup) await popup.close().catch(() => {});
+      if (page.url() !== beforeUrl) {
+        await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+      }
+    }
+  }
+}
+
+async function checkPage(page: Page, url: string, errors: string[], audit: ClickAudit) {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const unauthorizedResponses = new Set<string>();
@@ -173,53 +322,7 @@ async function checkPage(page: Page, url: string, errors: string[]) {
     }, url);
     for (const href of badInternalLinks) errors.push(`INVALID_LINK | ${url} | ${href}`);
 
-    const safeControls = page.locator(
-      'button:visible:not([type="submit"]), [role="button"]:visible, [aria-expanded]:visible'
-    );
-    const count = Math.min(await safeControls.count(), 20);
-    for (let index = 0; index < count; index++) {
-      const control = safeControls.nth(index);
-      const text = ((await control.innerText().catch(() => '')) || '').trim();
-      if (/送出|申請|預約|聯絡|撥打|電話|LINE|submit|send|apply|delete|remove/i.test(text)) continue;
-
-      const beforeClickUrl = page.url();
-      try {
-        await control.click({ timeout: 3_000 });
-        await page.waitForTimeout(500);
-
-        if (page.url() !== beforeClickUrl) {
-          const returned = await page.goBack({
-            waitUntil: 'domcontentloaded',
-            timeout: 10_000
-          }).catch(() => null);
-
-          if (!returned && page.url() !== beforeClickUrl) {
-            await page.goto(beforeClickUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 30_000
-            });
-          }
-          await page.waitForLoadState('domcontentloaded').catch(() => {});
-        }
-
-        await page.keyboard.press('Escape').catch(() => {});
-      } catch (error) {
-        if (page.url() !== beforeClickUrl) {
-          await page.goBack({
-            waitUntil: 'domcontentloaded',
-            timeout: 10_000
-          }).catch(async () => {
-            await page.goto(beforeClickUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 30_000
-            }).catch(() => {});
-          });
-          continue;
-        }
-
-        errors.push(`INTERACTION_FAILED | ${url} | ${text || `control-${index + 1}`} | ${String(error)}`);
-      }
-    }
+    await auditClickableElements(page, url, errors, audit);
 
     for (const message of consoleErrors.slice(0, 10)) {
       errors.push(`CONSOLE_ERROR | ${url} | ${message}`);
@@ -250,6 +353,7 @@ for (const site of SITES) {
   test(`${site.name}：Sitemap 全頁與互動巡檢`, async ({ page, request }, testInfo) => {
     const urls = await collectSitemapUrls(request, site.baseUrl);
     const errors: string[] = [];
+    const audit: ClickAudit = { discovered: 0, clicked: 0, excluded: [] };
 
     await testInfo.attach('discovered-urls.txt', {
       body: urls.join('\n'),
@@ -258,9 +362,20 @@ for (const site of SITES) {
 
     for (const url of urls) {
       await test.step(url, async () => {
-        await checkPage(page, url, errors);
+        await checkPage(page, url, errors, audit);
       });
     }
+
+    await testInfo.attach('click-audit.txt', {
+      body: [
+        `Discovered visible clickable elements: ${audit.discovered}`,
+        `Actually clicked: ${audit.clicked}`,
+        `Safely excluded: ${audit.excluded.length}`,
+        '',
+        ...audit.excluded
+      ].join('\n'),
+      contentType: 'text/plain'
+    });
 
     await testInfo.attach('qa-errors.txt', {
       body: errors.length ? errors.join('\n') : 'No errors found.',
