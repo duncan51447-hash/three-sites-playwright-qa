@@ -4,8 +4,10 @@ export default defineConfig({
   testDir: './tests',
   timeout: 90 * 60 * 1000,
   expect: { timeout: 10_000 },
-  fullyParallel: false,
-  workers: 1,
+  // Each site/device pair owns an isolated browser context, so three workers can
+  // run safely without changing coverage or sharing page state.
+  fullyParallel: true,
+  workers: 3,
   retries: 1,
   reporter: [
     ['list'],
