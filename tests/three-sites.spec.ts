@@ -4,6 +4,30 @@ type ClickAudit = {
   discovered: number;
   clicked: number;
   excluded: string[];
+  unavailable: string[];
+  blocked: string[];
+  warnings: string[];
+};
+
+type ClickTarget = {
+  key: string;
+  path: string;
+  tag: string;
+  type: string;
+  id: string;
+  href: string;
+  target: string;
+  role: string;
+  ariaLabel: string;
+  title: string;
+  name: string;
+  text: string;
+  label: string;
+  occurrence: number;
+};
+
+type QueuedClick = ClickTarget & {
+  revealers: ClickTarget[];
 };
 
 const SITES = [
@@ -112,131 +136,256 @@ const CLICKABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])'
 ].join(', ');
 
+async function discoverVisibleClickTargets(page: Page): Promise<ClickTarget[]> {
+  return page.locator(CLICKABLE_SELECTOR).evaluateAll((elements) => {
+    const normalize = (value: string | null | undefined) =>
+      (value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+
+    const cssPath = (element: Element) => {
+      const parts: string[] = [];
+      let current: Element | null = element;
+      while (current && current !== document.documentElement) {
+        const tag = current.tagName.toLowerCase();
+        if ((current as HTMLElement).id) {
+          parts.unshift(`#${CSS.escape((current as HTMLElement).id)}`);
+          return parts.join(' > ');
+        }
+        const parent: Element | null = current.parentElement;
+        if (!parent) break;
+        const siblings = [...parent.children].filter((sibling) => sibling.tagName === current!.tagName);
+        parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(current) + 1})`);
+        current = parent;
+      }
+      parts.unshift('html');
+      return parts.join(' > ');
+    };
+
+    const occurrences = new Map<string, number>();
+    const results: ClickTarget[] = [];
+    for (const element of elements as HTMLElement[]) {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const visible = style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      if (!visible || element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') continue;
+
+      const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
+      const text = normalize(element.innerText || element.textContent);
+      const target = {
+        path: cssPath(element),
+        tag: element.tagName.toLowerCase(),
+        type: normalize(element.getAttribute('type')).toLowerCase(),
+        id: normalize(element.id),
+        href: anchor?.href || '',
+        target: anchor?.target || '',
+        role: normalize(element.getAttribute('role')).toLowerCase(),
+        ariaLabel: normalize(element.getAttribute('aria-label')),
+        title: normalize(element.getAttribute('title')),
+        name: normalize(element.getAttribute('name')),
+        text,
+        label: normalize(text || element.getAttribute('aria-label') || element.getAttribute('title') ||
+          (element as HTMLInputElement).value || anchor?.href || element.tagName)
+      };
+      const fingerprint = JSON.stringify([
+        target.tag, target.type, target.id, target.href, target.role,
+        target.ariaLabel, target.title, target.name, target.text
+      ]);
+      const occurrence = occurrences.get(fingerprint) || 0;
+      occurrences.set(fingerprint, occurrence + 1);
+      results.push({
+        ...target,
+        occurrence,
+        key: `${target.path}|${fingerprint}|${occurrence}`
+      });
+    }
+    return results;
+  });
+}
+
+async function locateClickTarget(page: Page, target: ClickTarget) {
+  const byPath = page.locator(target.path).first();
+  if (await byPath.count()) {
+    const matches = await byPath.evaluate((element, expected) => {
+      const normalize = (value: string | null | undefined) =>
+        (value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+      const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
+      const text = normalize((element as HTMLElement).innerText || element.textContent);
+      return element.tagName.toLowerCase() === expected.tag &&
+        normalize(element.getAttribute('type')).toLowerCase() === expected.type &&
+        normalize((element as HTMLElement).id) === expected.id &&
+        (anchor?.href || '') === expected.href &&
+        normalize(element.getAttribute('role')).toLowerCase() === expected.role &&
+        normalize(element.getAttribute('aria-label')) === expected.ariaLabel &&
+        normalize(element.getAttribute('title')) === expected.title &&
+        normalize(element.getAttribute('name')) === expected.name &&
+        text === expected.text;
+    }, target).catch(() => false);
+    if (matches) return byPath;
+  }
+
+  const index = await page.locator(CLICKABLE_SELECTOR).evaluateAll((elements, expected) => {
+    const normalize = (value: string | null | undefined) =>
+      (value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+    let occurrence = 0;
+    for (let index = 0; index < elements.length; index++) {
+      const element = elements[index] as HTMLElement;
+      const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
+      const text = normalize(element.innerText || element.textContent);
+      const matches = element.tagName.toLowerCase() === expected.tag &&
+        normalize(element.getAttribute('type')).toLowerCase() === expected.type &&
+        normalize(element.id) === expected.id &&
+        (anchor?.href || '') === expected.href &&
+        normalize(element.getAttribute('role')).toLowerCase() === expected.role &&
+        normalize(element.getAttribute('aria-label')) === expected.ariaLabel &&
+        normalize(element.getAttribute('title')) === expected.title &&
+        normalize(element.getAttribute('name')) === expected.name &&
+        text === expected.text;
+      if (!matches) continue;
+      if (occurrence === expected.occurrence) return index;
+      occurrence++;
+    }
+    return -1;
+  }, target);
+
+  return index >= 0 ? page.locator(CLICKABLE_SELECTOR).nth(index) : null;
+}
+
+function isSameDocument(left: string, right: string) {
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    return a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
+  } catch {
+    return false;
+  }
+}
+
+function addUnique(values: string[], value: string) {
+  if (!values.includes(value)) values.push(value);
+}
+
 async function auditClickableElements(
   page: Page,
   url: string,
   errors: string[],
   audit: ClickAudit
 ) {
-  // Mark the current DOM so each control can be reacquired after other clicks change
-  // the layout. Newly revealed controls (for example a mobile menu) are appended below.
+  // Every click runs in a fresh page. A menu, accordion or navigation click can no
+  // longer change the DOM used by any later click.
   const known = new Set<string>();
-  const queue: string[] = [];
+  const queue: QueuedClick[] = [];
 
-  const discoverVisibleControls = async () => {
-    const discovered = await page.locator(CLICKABLE_SELECTOR).evaluateAll((elements) => {
-      const results: { id: string; label: string; href: string; tag: string; type: string }[] = [];
-      for (const [index, element] of (elements as HTMLElement[]).entries()) {
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        const visible = style.display !== 'none' && style.visibility !== 'hidden' &&
-          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
-        if (!visible || element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') continue;
-
-        // The DOM index is stable after returning to the same page, unlike a
-        // monotonically allocated id which would be lost on navigation.
-        const qaId = `qa-${index}`;
-        element.dataset.qaClickId = qaId;
-        const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
-        results.push({
-          id: qaId,
-          label: (element.innerText || element.getAttribute('aria-label') || element.getAttribute('title') ||
-            (element as HTMLInputElement).value || anchor?.href || element.tagName).trim().replace(/\s+/g, ' ').slice(0, 180),
-          href: anchor?.href || '',
-          tag: element.tagName.toLowerCase(),
-          type: (element.getAttribute('type') || '').toLowerCase()
-        });
-      }
-      return results;
-    });
-
-    for (const item of discovered) {
-      if (known.has(item.id)) continue;
-      known.add(item.id);
+  const enqueue = (targets: ClickTarget[], revealers: ClickTarget[]) => {
+    for (const target of targets) {
+      if (known.has(target.key)) continue;
+      known.add(target.key);
       audit.discovered++;
-      queue.push(JSON.stringify(item));
+      queue.push({ ...target, revealers });
     }
   };
 
-  await discoverVisibleControls();
+  enqueue(await discoverVisibleClickTargets(page), []);
 
   for (let cursor = 0; cursor < queue.length; cursor++) {
-    const item = JSON.parse(queue[cursor]) as {
-      id: string; label: string; href: string; tag: string; type: string;
-    };
+    const item = queue[cursor];
     const description = item.label || `${item.tag}-${cursor + 1}`;
     const unsafeProtocol = /^(?:tel|mailto|sms):/i.test(item.href);
     const externalCommunication = /(?:line\.me|lin\.ee|m\.me|messenger\.com|wa\.me)/i.test(item.href);
     const sideEffectText = /送出|提交|立即申請|免費申請|預約|撥打|電話|加好友|加入好友|聯絡我們|付款|購買|刪除|移除|submit|send|apply|delete|remove|pay|checkout/i.test(description);
     const submitControl = item.type === 'submit';
+    const captchaControl = /驗證.*人類|captcha/i.test(description);
 
-    if (unsafeProtocol || externalCommunication || submitControl || sideEffectText) {
+    if (unsafeProtocol || externalCommunication || submitControl || sideEffectText || captchaControl) {
       audit.excluded.push(`${url} | ${description} | ${item.href || item.type || 'potential side effect'}`);
       continue;
     }
 
-    let control = page.locator(`[data-qa-click-id="${item.id}"]`).first();
-    if (!(await control.count())) {
-      await discoverVisibleControls();
-      control = page.locator(`[data-qa-click-id="${item.id}"]`).first();
-    }
-    if (!(await control.count())) {
-      errors.push(`INTERACTION_NOT_REACQUIRED | ${url} | ${description}`);
-      continue;
-    }
-
-    const beforeUrl = page.url();
-    let popup: Page | null = null;
-    try {
-      await control.scrollIntoViewIfNeeded({ timeout: 5_000 });
-      await page.waitForTimeout(250);
-
-      // Keep ordinary links in a new tab. This is still a real browser click,
-      // while preserving the source DOM so every remaining control is tested.
-      if (item.href) {
-        await control.evaluate((element) => {
-          const anchor = element instanceof HTMLAnchorElement ? element : element.closest('a');
-          if (anchor) anchor.target = '_blank';
-        });
+    const actionPage = await page.context().newPage();
+    const documentFailures: { status: number; resourceUrl: string }[] = [];
+    const onResponse = (response: { status(): number; url(): string; request(): { resourceType(): string }; frame(): { parentFrame(): unknown } }) => {
+      if (response.status() >= 400 && response.request().resourceType() === 'document' && !response.frame().parentFrame()) {
+        documentFailures.push({ status: response.status(), resourceUrl: response.url() });
       }
-      const popupPromise = item.href
-        ? page.waitForEvent('popup', { timeout: 5_000 }).catch(() => null)
-        : Promise.resolve(null);
-      await control.click({ timeout: 5_000 });
-      popup = await popupPromise;
-      audit.clicked++;
+    };
+    page.context().on('response', onResponse);
 
-      if (popup) {
-        await popup.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
-        const popupUrl = popup.url();
-        const popupResponse = await popup.request.get(popupUrl, { timeout: 15_000 }).catch(() => null);
-        if (popupResponse && popupResponse.status() >= 400) {
-          errors.push(`CLICK_TARGET_HTTP_${popupResponse.status()} | ${url} | ${description} | ${popupUrl}`);
+    try {
+      const response = await actionPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      if (!response || response.status() >= 400) {
+        errors.push(`CLICK_SETUP_HTTP_${response?.status() || 'NO_RESPONSE'} | ${url} | ${description}`);
+        continue;
+      }
+      await actionPage.waitForTimeout(350);
+
+      let revealFailed = false;
+      for (const revealer of item.revealers) {
+        const revealerControl = await locateClickTarget(actionPage, revealer);
+        if (!revealerControl || !(await revealerControl.isVisible())) {
+          addUnique(audit.unavailable, `${url} | ${description} | revealer unavailable: ${revealer.label}`);
+          revealFailed = true;
+          break;
         }
-        await popup.close().catch(() => {});
-      } else {
-        await page.waitForTimeout(650);
-        const afterUrl = page.url();
-        if (afterUrl !== beforeUrl) {
-          const response = await page.request.get(afterUrl, { timeout: 15_000 }).catch(() => null);
-          if (response && response.status() >= 400) {
-            errors.push(`CLICK_TARGET_HTTP_${response.status()} | ${url} | ${description} | ${afterUrl}`);
-          }
-          await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(async () => {
-            await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-          });
-        } else {
-          // A menu, accordion, tab or modal may expose more clickable controls.
-          await discoverVisibleControls();
-          await page.keyboard.press('Escape').catch(() => {});
+        await revealerControl.scrollIntoViewIfNeeded({ timeout: 5_000 });
+        await revealerControl.click({ timeout: 5_000 });
+        await actionPage.waitForTimeout(300);
+      }
+      if (revealFailed) continue;
+
+      const control = await locateClickTarget(actionPage, item);
+      if (!control || !(await control.isVisible())) {
+        addUnique(audit.unavailable, `${url} | ${description}`);
+        continue;
+      }
+
+      await control.scrollIntoViewIfNeeded({ timeout: 5_000 });
+      await actionPage.waitForTimeout(250);
+
+      const receivesPointer = await control.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const x = Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width / 2));
+        const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height / 2));
+        const top = document.elementFromPoint(x, y);
+        return Boolean(top && (element === top || element.contains(top) || top.contains(element)));
+      }).catch(() => false);
+      if (!receivesPointer) {
+        addUnique(audit.blocked, `${url} | ${description} | covered or outside active viewport`);
+        continue;
+      }
+
+      const pagesBefore = new Set(page.context().pages());
+      const beforeUrl = actionPage.url();
+      await control.click({ timeout: 5_000 });
+      audit.clicked++;
+      await actionPage.waitForTimeout(700);
+
+      for (const failure of documentFailures) {
+        let sameSite = false;
+        try {
+          sameSite = new URL(failure.resourceUrl).origin === new URL(url).origin;
+        } catch {}
+        const finding = `CLICK_TARGET_HTTP_${failure.status} | ${url} | ${description} | ${failure.resourceUrl}`;
+        if (sameSite) errors.push(finding);
+        else addUnique(audit.warnings, finding);
+      }
+
+      // Buttons, menus, tabs and accordions can reveal more controls. Replay the
+      // same opener in a fresh page when those newly visible controls are tested.
+      if (item.revealers.length < 2 && isSameDocument(beforeUrl, actionPage.url())) {
+        const revealed = await discoverVisibleClickTargets(actionPage);
+        enqueue(revealed, [...item.revealers, item]);
+      }
+
+      for (const openedPage of page.context().pages()) {
+        if (!pagesBefore.has(openedPage) && openedPage !== actionPage) {
+          await openedPage.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
+          await openedPage.close().catch(() => {});
         }
       }
     } catch (error) {
       errors.push(`INTERACTION_FAILED | ${url} | ${description} | ${String(error)}`);
-      if (popup) await popup.close().catch(() => {});
-      if (page.url() !== beforeUrl) {
-        await page.goto(beforeUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-      }
+    } finally {
+      page.context().off('response', onResponse);
+      await actionPage.close().catch(() => {});
     }
   }
 }
@@ -254,6 +403,10 @@ async function checkPage(page: Page, url: string, errors: string[], audit: Click
     }
     if (/Failed to load resource:.*status of 401/i.test(text)) {
       console.warn(`QA_WARNING | ${url} | 401 resource detected; exact URL recorded from the response event`);
+      return;
+    }
+    if (/Content Security Policy.*report-only|violates.*report-only Content Security Policy/i.test(text)) {
+      console.warn(`QA_WARNING | ${url} | CSP_REPORT_ONLY | ${text}`);
       return;
     }
     if (message.type() === 'error' && !/favicon|third-party cookie/i.test(text)) {
@@ -353,7 +506,14 @@ for (const site of SITES) {
   test(`${site.name}：Sitemap 全頁與互動巡檢`, async ({ page, request }, testInfo) => {
     const urls = await collectSitemapUrls(request, site.baseUrl);
     const errors: string[] = [];
-    const audit: ClickAudit = { discovered: 0, clicked: 0, excluded: [] };
+    const audit: ClickAudit = {
+      discovered: 0,
+      clicked: 0,
+      excluded: [],
+      unavailable: [],
+      blocked: [],
+      warnings: []
+    };
 
     await testInfo.attach('discovered-urls.txt', {
       body: urls.join('\n'),
@@ -371,8 +531,21 @@ for (const site of SITES) {
         `Discovered visible clickable elements: ${audit.discovered}`,
         `Actually clicked: ${audit.clicked}`,
         `Safely excluded: ${audit.excluded.length}`,
+        `Unavailable after clean reload: ${audit.unavailable.length}`,
+        `Covered or not pointer-actionable: ${audit.blocked.length}`,
+        `External/background warnings: ${audit.warnings.length}`,
         '',
-        ...audit.excluded
+        '[SAFELY EXCLUDED]',
+        ...audit.excluded,
+        '',
+        '[UNAVAILABLE]',
+        ...audit.unavailable,
+        '',
+        '[COVERED OR NOT ACTIONABLE]',
+        ...audit.blocked,
+        '',
+        '[WARNINGS]',
+        ...audit.warnings
       ].join('\n'),
       contentType: 'text/plain'
     });
