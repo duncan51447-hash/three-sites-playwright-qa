@@ -761,6 +761,7 @@ for (const site of selectedSites) {
     const urls = [...queuedUrls];
     const crawlDiscovered: string[] = [];
     const onInternalUrl = (candidate: string) => {
+      if (scope !== 'full') return;
       if (allKnownUrls.has(candidate)) return;
       allKnownUrls.add(candidate);
       queuedUrls.add(candidate);
