@@ -8,7 +8,9 @@ export default defineConfig({
   // run safely without changing coverage or sharing page state.
   fullyParallel: true,
   workers: 3,
-  retries: 1,
+  // A full shard can contain hundreds of pages; retry failures at the page/action
+  // level in the test instead of rerunning an entire shard from the beginning.
+  retries: 0,
   reporter: [
     ['list'],
     ['html', { outputFolder: 'playwright-report', open: 'never' }],
@@ -24,8 +26,10 @@ export default defineConfig({
       slowMo: 120
     },
     screenshot: 'only-on-failure',
-    trace: 'retain-on-failure',
-    video: 'retain-on-failure'
+    // Text inventories name the exact page/control/resource. Recording every page
+    // in a full shard produced multi-gigabyte artifacts and did not add diagnosis.
+    trace: 'off',
+    video: 'off'
   },
   projects: [
     {

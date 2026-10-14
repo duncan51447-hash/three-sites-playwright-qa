@@ -2,6 +2,15 @@ name: Daily Three-Site QA
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: QA coverage
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
   schedule:
     # 06:00 Asia/Taipei = 22:00 UTC on the previous day
     - cron: '0 22 * * *'
@@ -12,9 +21,10 @@ permissions:
   contents: read
 
 jobs:
-  playwright-qa:
+  smoke-qa:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'smoke')
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -35,12 +45,72 @@ jobs:
         run: npx playwright test
         env:
           TZ: Asia/Taipei
+          QA_SCOPE: smoke
 
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-qa-report-${{ github.run_number }}
+          name: playwright-smoke-report-${{ github.run_number }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+
+  full-qa:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { site: pl168, project: desktop-chromium, shard: 0, shards: 2 }
+          - { site: pl168, project: desktop-chromium, shard: 1, shards: 2 }
+          - { site: pl168, project: mobile-chromium, shard: 0, shards: 2 }
+          - { site: pl168, project: mobile-chromium, shard: 1, shards: 2 }
+          - { site: jf1688, project: desktop-chromium, shard: 0, shards: 4 }
+          - { site: jf1688, project: desktop-chromium, shard: 1, shards: 4 }
+          - { site: jf1688, project: desktop-chromium, shard: 2, shards: 4 }
+          - { site: jf1688, project: desktop-chromium, shard: 3, shards: 4 }
+          - { site: jf1688, project: mobile-chromium, shard: 0, shards: 4 }
+          - { site: jf1688, project: mobile-chromium, shard: 1, shards: 4 }
+          - { site: jf1688, project: mobile-chromium, shard: 2, shards: 4 }
+          - { site: jf1688, project: mobile-chromium, shard: 3, shards: 4 }
+          - { site: firstloan, project: desktop-chromium, shard: 0, shards: 2 }
+          - { site: firstloan, project: desktop-chromium, shard: 1, shards: 2 }
+          - { site: firstloan, project: mobile-chromium, shard: 0, shards: 2 }
+          - { site: firstloan, project: mobile-chromium, shard: 1, shards: 2 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run full clickable QA shard
+        run: npx playwright test --project="${{ matrix.project }}"
+        env:
+          TZ: Asia/Taipei
+          QA_SCOPE: full
+          QA_SITE: ${{ matrix.site }}
+          QA_SHARD_INDEX: ${{ matrix.shard }}
+          QA_SHARD_TOTAL: ${{ matrix.shards }}
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-full-${{ matrix.site }}-${{ matrix.project }}-${{ matrix.shard }}-${{ github.run_number }}
           path: |
             playwright-report/
             test-results/
