@@ -1,6 +1,7 @@
 import { request } from '@playwright/test';
 import { mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
-import { SITES, PROJECTS, publicUrl, decodeEntities, htmlLinks } from '../qa/config.mjs';
+import { SITES, publicUrl, decodeEntities, htmlLinks } from '../qa/config.mjs';
+import { buildMatrix } from '../qa/matrix.mjs';
 
 const scope = process.env.QA_SCOPE || 'full';
 const directory = process.env.QA_MANIFEST_DIR || 'qa-manifest';
@@ -100,11 +101,7 @@ try {
   }
 } finally { await client.dispose(); }
 
-const include = inventories.flatMap(site => {
-  const shards = scope === 'smoke' ? 1 : Math.max(1, Math.min(40, Math.ceil(site.urls.length / 25)));
-  return PROJECTS.flatMap(project => Array.from({ length: shards }, (_, shard) => ({ site: site.key, project, shard, shards })));
-}).sort((a,b) => a.shard - b.shard || a.site.localeCompare(b.site) || a.project.localeCompare(b.project));
-const matrix = JSON.stringify({ include });
+const matrix = JSON.stringify(buildMatrix(inventories,scope));
 writeFileSync(`${directory}/matrix.json`, matrix);
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${matrix}\n`);
 if (inventories.some(site => !site.complete)) process.exitCode = 1;

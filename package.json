@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test:persistence": "node scripts/check-persistence.mjs",
     "test:collect": "node scripts/check-collection.mjs",
+    "test:matrix": "node scripts/check-matrix.mjs",
     "report:qa": "node scripts/report-qa.mjs --gate",
     "report": "playwright show-report"
   },
