@@ -3,8 +3,12 @@ import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { SITES, STEP_DELAY_MS } from '../qa/config.mjs';
-import { ENGINE_VERSION } from '../qa/engine-version.mjs';
 import { auditPage, PageResult, atomicJson } from '../qa/audit';
+
+const ENGINE_VERSION = createHash('sha256').update([
+  'qa/audit.ts', 'qa/config.mjs', 'tests/three-sites.spec.ts',
+  'playwright.config.ts', 'package-lock.json'
+].map(path => readFileSync(join(__dirname,'..',path),'utf8')).join('\n')).digest('hex');
 
 const requestedSite = process.env.QA_SITE;
 const sites = SITES.filter(site => !requestedSite || requestedSite === site.key);

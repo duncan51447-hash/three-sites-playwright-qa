@@ -9,6 +9,7 @@
     "test:engine": "playwright test -c playwright.engine.config.ts",
     "typecheck": "tsc --noEmit",
     "test:persistence": "node scripts/check-persistence.mjs",
+    "test:collect": "node scripts/check-collection.mjs",
     "report:qa": "node scripts/report-qa.mjs --gate",
     "report": "playwright show-report"
   },

@@ -15,6 +15,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run test:collect
       - run: npm run test:persistence
       - run: npx playwright install --with-deps chromium --only-shell
       - run: npm run test:engine
