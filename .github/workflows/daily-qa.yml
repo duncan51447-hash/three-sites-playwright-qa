@@ -13,6 +13,10 @@ on:
         description: Optional same-version run ID; resume incomplete pages from its combined artifact
         required: false
         type: string
+      inventory_run_id:
+        description: Optional same-day fixed inventory run ID, for QA-engine fixes without recrawling
+        required: false
+        type: string
   schedule:
     - cron: '0 22 * * *'
 
@@ -29,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
-      matrix: ${{ steps.inventory.outputs.matrix }}
+      matrix: ${{ steps.inventory.outputs.matrix || steps.reuse.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,7 +43,22 @@ jobs:
       - run: npm ci
       - name: Build fixed public-page inventory
         id: inventory
+        if: ${{ inputs.inventory_run_id == '' }}
         run: npm run prepare:qa
+        env:
+          QA_SCOPE: ${{ inputs.scope || 'full' }}
+      - name: Reuse immutable same-day inventory when requested
+        if: ${{ inputs.inventory_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: qa-manifest
+          path: qa-manifest
+          run-id: ${{ inputs.inventory_run_id }}
+          github-token: ${{ github.token }}
+      - name: Validate reused inventory
+        id: reuse
+        if: ${{ inputs.inventory_run_id != '' }}
+        run: node scripts/reuse-inventory.mjs
         env:
           QA_SCOPE: ${{ inputs.scope || 'full' }}
       - name: Upload inventory even when discovery is incomplete

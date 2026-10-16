@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler",
+    "noEmit": true, "strict": true, "noImplicitAny": false,
+    "allowJs": true, "checkJs": false, "skipLibCheck": true, "types": ["node"]
+  },
+  "include": ["qa/**/*.ts", "qa-regression/**/*.ts", "tests/**/*.ts", "playwright*.ts"]
+}

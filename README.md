@@ -64,6 +64,17 @@ failed, missing and interrupted pages are rerun. Browser tests have no action or
 page sampling limit. A 45-minute per-page or 5.5-hour runner timeout remains an
 explicit incomplete failure with retained checkpoints, never a silent pass.
 
+`inventory_run_id` can reuse an immutable complete manifest from the preceding
+24 hours when repairing the QA engine. Its original collection timestamp is
+retained. This avoids repeating the sitemap/HTML crawl during a same-day fix;
+all browser interactions are still rerun for the new commit.
+
+Embedded video overlays and iframe player gestures are included. YouTube/Vimeo
+playback is checked for advancing video time, then paused when possible. A player
+whose playback cannot be confirmed is explicitly marked `interaction_only` with
+`QA_WARNING`; the external provider's account/sharing/purchase interfaces are
+outside these three websites' QA scope.
+
 ## Engine regression checks
 
 Local fixture pages verify desktop/touch clicks, duplicate hrefs at distinct

@@ -20,6 +20,7 @@ export type PageResult = {
   findings: Finding[]; warnings: Finding[]; discoveredUrls: string[];
   scopeLimitations: string[]; title?: string; httpStatus?: number; currentAction?: string;
   commit?: string;
+  scroll?: { step: number; y: number; height: number; total: number };
 };
 
 export function atomicJson(path: string, value: unknown) {
@@ -37,7 +38,7 @@ export class Pacer {
   }
 }
 
-const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,[role="button"],[role="link"],[aria-expanded],summary,[onclick],[tabindex]:not([tabindex="-1"]),.av-submenu-indicator,.kksr-star,video';
+const selector = 'a[href],button,input:not([type="hidden"]),textarea,select,[role="button"],[role="link"],[aria-expanded],summary,[onclick],[tabindex]:not([tabindex="-1"]),.av-submenu-indicator,.av-click-to-play-overlay,.kksr-star,video,iframe[src]';
 
 export async function discover(page: Page): Promise<Target[]> {
   return page.locator(selector).evaluateAll(elements => {
@@ -68,7 +69,7 @@ export async function discover(page: Page): Promise<Target[]> {
       if (!visible) continue;
       if (!element.matches('a,button,input,textarea,select,summary,video,.av-submenu-indicator,.kksr-star') && element.closest('a,button') !== null) continue;
       const tag = element.tagName.toLowerCase();
-      const href = element instanceof HTMLAnchorElement ? element.href : '';
+      const href = element instanceof HTMLAnchorElement ? element.href : element instanceof HTMLIFrameElement ? element.src : '';
       const type = text(element.getAttribute('type')).toLowerCase();
       const aria = text(element.getAttribute('aria-label'));
       const name = text(element.getAttribute('name'));
@@ -145,7 +146,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   context.on('response', onResponse);
   context.on('requestfailed', onFailed);
   await context.exposeBinding('__qaHandoff', (_event, href: string) => {
-    if (active) { active.evidence = `Trusted click observed; external handoff blocked: ${href}`; active.status = 'interaction_only'; save(); }
+    if (active) { active.evidence = `Trusted browser action observed; outgoing handoff/submission prevented: ${href}`; active.status = 'interaction_only'; save(); }
   });
   // Browser instrumentation preserves the trusted click but prevents a real
   // telephone/mail application from being launched. Website source is untouched.
@@ -155,6 +156,13 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
       if (element instanceof HTMLAnchorElement && /^(?:tel|mailto|sms):/i.test(element.href)) {
         event.preventDefault(); event.stopImmediatePropagation();
         void (window as any).__qaHandoff(element.href);
+      }
+    }, true);
+    document.addEventListener('submit', event => {
+      const form = event.target;
+      if (form instanceof HTMLFormElement && (form.method.toLowerCase() !== 'get' || form.closest('.wpcf7'))) {
+        event.preventDefault(); event.stopImmediatePropagation();
+        void (window as any).__qaHandoff(`FORM ${form.method.toUpperCase()} ${form.action}`);
       }
     }, true);
   });
@@ -220,7 +228,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     for (const target of targets) {
       if (known.has(target.key)) continue;
       known.add(target.key);
-      const internal = publicUrl(target.href, source);
+      const internal = target.tag === 'a' ? publicUrl(target.href, source) : null;
       if (target.href && internal && !result.discoveredUrls.includes(internal)) result.discoveredUrls.push(internal);
       const reason = target.disabled ? 'disabled control' : loginUrl(target.href) || target.type === 'password' ? 'authentication excluded by user' : /captcha|驗證.*人類/i.test(target.label) ? 'third-party CAPTCHA challenge' : '';
       result.actions.push({ key: target.key, selector: target.path, label: target.label, href: target.href, status: reason ? 'excluded' : 'pending', clicks: 0, ...(reason ? { reason } : {}) });
@@ -245,16 +253,43 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     if (!result.title.trim()) add(false, 'EMPTY_TITLE', 'Page title is empty', source);
     await page.locator('body').waitFor({ state: 'visible', timeout: 10000 });
     enqueue(await discover(page), []);
+    await reset();
     if (mobile) cdp = await context.newCDPSession(page);
     let reachedBottom = false;
+    let stagnantScrolls = 0;
     for (let index = 0; index < 150; index++) {
-      const d = await page.evaluate(() => ({ y: scrollY, height: innerHeight, total: document.documentElement.scrollHeight }));
+      const d = await page.evaluate(() => ({ y: scrollY, height: innerHeight, total: document.documentElement.scrollHeight, width: innerWidth }));
+      result.scroll = { step: index, y: d.y, height: d.height, total: d.total }; save();
       if (d.y + d.height >= d.total - 12) { reachedBottom = true; break; }
       await pace.step(async () => {
-        if (cdp) await cdp.send('Input.synthesizeScrollGesture', { x: 195, y: 570, yDistance: -Math.round(d.height * .78), speed: 750, gestureSourceType: 'touch' });
-        else await page.mouse.wheel(0, Math.round(d.height * .78));
+        if (cdp) {
+          // Dispatch a bounded touch drag. synthesizeScrollGesture can wait
+          // indefinitely for a compositor acknowledgement when an iframe exists.
+          const x = 8, start = Math.round(d.height * .78), distance = Math.round(d.height * .58);
+          try {
+            await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: start, id: 1 }] });
+            for (let move = 1; move <= 8; move++) {
+              await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: Math.round(start - distance * move / 8), id: 1 }] });
+              await page.waitForTimeout(25);
+            }
+          } finally { await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }).catch(() => {}); }
+        }
+        else { await page.mouse.move(8, Math.round(d.height * .65)); await page.mouse.wheel(0, Math.round(d.height * .78)); }
       });
       await page.waitForTimeout(250);
+      const nextY = await page.evaluate(() => scrollY);
+      stagnantScrolls = Math.abs(nextY - d.y) < 2 ? stagnantScrolls + 1 : 0;
+      if (stagnantScrolls >= 2) {
+        // Touch gestures over embedded content may be consumed by the frame.
+        // A real keyboard page-down moves the parent page without DOM rewriting.
+        await pace.step(() => page.keyboard.press('PageDown'));
+        await page.waitForTimeout(250);
+        if (await page.evaluate(() => scrollY) <= d.y + 2) {
+          add(false, 'SCROLL_BLOCKED', 'Touch/wheel and keyboard scrolling could not move the public page', source);
+          break;
+        }
+        stagnantScrolls = 0;
+      }
       enqueue(await discover(page), []);
     }
     if (!reachedBottom) add(false, 'SCROLL_INCOMPLETE', 'Page did not reach the bottom within 150 visitor scrolls', source);
@@ -287,7 +322,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             enqueue(await discover(page), [...revealers, { target, kind: 'hover' }]);
           }
           const before = page.url(), pagesBefore = new Set(context.pages());
-          const isLink = /^https?:/i.test(target.href);
+          const isLink = target.tag === 'a' && /^https?:/i.test(target.href);
           await click(control, isLink && !mobile && !sameDocument(before, target.href));
           await page.waitForTimeout(350);
           let opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
@@ -303,6 +338,26 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             if (popup.url() === 'about:blank') throw new Error('New tab never navigated');
           }
           if (!opened.length) active.destination = page.url();
+          if (target.tag === 'iframe') {
+            active.destination = target.href;
+            const frame = await (await control.elementHandle())?.contentFrame();
+            if (frame && /(?:youtube(?:-nocookie)?\.com|vimeo\.com)/i.test(target.href)) {
+              const playing = await frame.waitForFunction(() => {
+                const video = document.querySelector('video');
+                return video && !video.paused && video.currentTime > 0;
+              }, undefined, { timeout: 8000 }).then(() => true).catch(() => false);
+              if (playing) {
+                active.evidence = 'Embedded video playback advanced after a trusted browser gesture';
+                const pause = frame.locator('button.ytp-play-button').first();
+                if (await pause.isVisible().catch(() => false)) await click(pause);
+              } else {
+                active.status = 'interaction_only'; active.evidence = 'Embedded player clicked; third-party playback could not be confirmed';
+                add(true, 'EMBEDDED_PLAYBACK_UNCONFIRMED', active.evidence, target.href);
+              }
+            } else {
+              active.status = 'interaction_only'; active.evidence = 'Embedded frame received a trusted pointer gesture; external service not submitted';
+            }
+          }
           if (isLink && !sameDocument(before, target.href) && !opened.length && sameDocument(before, page.url()) && active.status !== 'interaction_only' && !await modal()) throw new Error(`Click produced no navigation or dialog: ${target.href}`);
           if (sameDocument(source, page.url()) && (!isLink || sameDocument(before, target.href) || await modal())) {
             const revealed = await discover(page);

@@ -18,6 +18,7 @@ test.beforeAll(async () => {
     if (request.url === '/bad.png') { response.writeHead(404); response.end('missing'); return; }
     if (request.url === '/warning.png') { response.writeHead(401); response.end('unauthorized'); return; }
     response.setHeader('content-type', 'text/html');
+    if (request.url === '/player/') { response.end('<title>Player</title><button style="position:fixed;inset:0" onclick="this.textContent=\'Playing\'">Play</button>'); return; }
     if (request.url !== '/') { response.end('<title>Destination</title><main>destination loaded</main>'); return; }
     response.end(`<!doctype html><title>QA fixture</title>
       <style>body{margin:0;padding:25px}a,button,input,select{display:block;margin:15px;padding:8px}#panel{display:none}.av-burger-overlay-active #panel{display:block}.mfp-wrap{display:none;position:fixed;inset:0;background:#eee;z-index:20}.mfp-wrap.open{display:block}#speak-box-close{display:none}</style>
@@ -31,6 +32,8 @@ test.beforeAll(async () => {
       <div id="modal" class="mfp-wrap"><button class="mfp-close" id="close" onclick="document.getElementById('modal').classList.remove('open')">Close photo</button></div>
       <form><input id="name" name="name" placeholder="Name" required><button id="submit" type="submit">Submit</button></form>
       <button id="post" onclick="fetch('/submit/',{method:'POST',body:'test'}).catch(()=>{})">Read-only guarded action</button>
+      <div id="play-overlay" class="av-click-to-play-overlay" style="cursor:pointer;padding:20px" onclick="document.getElementById('player').hidden=false">Embedded play overlay</div>
+      <iframe id="player" title="Embedded player" src="/player/" hidden></iframe>
       <a id="login" href="/wp-login.php">Login</a>
       <div style="height:1000px">scroll content</div><button id="bottom">Bottom button</button>
       <script>document.addEventListener('click',e=>{window.counts ||= {};if(e.isTrusted&&e.target.id)window.counts[e.target.id]=(window.counts[e.target.id]||0)+1},true)</script>`);
@@ -47,7 +50,7 @@ test('physically clicks duplicate links, hidden menus, lightbox, touch and form 
   await auditPage(page, result, path, { delay: 0 });
   expect(result.complete, JSON.stringify(result.findings)).toBe(true);
   expect(result.findings).toEqual([]);
-  for (const id of ['menu','child','nested','deep','ordinary','same1','same2','popup','phone','photo','close','name','submit','post','bottom']) {
+  for (const id of ['menu','child','nested','deep','ordinary','same1','same2','popup','phone','photo','close','name','submit','post','bottom','play-overlay','player']) {
     const action = result.actions.find(action => action.selector === `#${id}`);
     expect(action, `Missing ${id}`).toBeTruthy();
     expect(action!.clicks, `${id}: ${action!.reason}`).toBeGreaterThan(0);
@@ -83,7 +86,7 @@ test('never reports incomplete or missing device coverage as success', async () 
   const { summary } = generateReport({ resultsDir:join(root,'results'), manifestDir:join(root,'manifest'), outputDir:join(root,'report') });
   expect(summary.overall).toBe('failed');
   expect(summary.complete).toBe(false);
-  expect(summary.groups.find(g => g.device === 'mobile-chromium').missingPages).toEqual([url]);
+  expect(summary.groups.find(g => g.device === 'mobile-chromium')!.missingPages).toEqual([url]);
   expect(readFileSync(join(root,'report','click-audit.txt'),'utf8')).toContain('interrupted');
 });
 
