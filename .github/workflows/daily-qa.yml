@@ -41,6 +41,11 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - name: Verify production QA boots before expanding browser shards
+        run: |
+          npm run typecheck
+          npm run test:collect
+          npm run test:matrix
       - name: Build fixed public-page inventory
         id: inventory
         if: ${{ inputs.inventory_run_id == '' }}
@@ -131,10 +136,12 @@ jobs:
         with:
           node-version: '22'
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: qa-manifest
           path: qa-manifest
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: qa-results-*
           path: downloaded-results

@@ -8,6 +8,9 @@ jf1688.com.tw and firstloan.tw. This repository does not deploy website changes.
 ```
 npm ci
 npx playwright install --with-deps chromium --only-shell
+npm run typecheck
+npm run test:collect
+npm run test:matrix
 npm run test:engine
 QA_SCOPE=full npm run prepare:qa
 npm test
@@ -23,6 +26,9 @@ links are still interacted with where applicable.
 
 Every URL is its own isolated Playwright test, assigned to exactly one shard per
 device. The same header/button on different pages is clicked separately.
+Runner allocation balances page counts between sites within GitHub's 256-job
+matrix limit. The present 5,172-URL inventory uses 250 shards, with no more than
+42 pages in a shard, 18 active shards and four page workers per shard.
 Desktop links use real Ctrl-click/new-tab navigation; mobile uses real touch
 taps and browser Back. Scrolling, hovering, clicks and input steps are paced at
 least three seconds apart. Differential discovery tests children of menus,
@@ -63,6 +69,10 @@ failed control, same-site HTTP/resource failure, page JavaScript error, broken
 image, empty title or horizontal overflow. Storage-access warnings, report-only
 CSP and third-party resource failures remain `QA_WARNING`. Script-order errors
 such as `jQuery is not defined` are not suppressed.
+Missing inventory is an incomplete failure for each required site/device.
+Chinese explanations and P1/P2/P3 priorities separate website faults, interactions
+requiring review, QA coverage gaps and background warnings. Missing artifacts
+still produce a final coverage report instead of skipping the report job.
 
 An interrupted run may be dispatched again with `resume_run_id`. Only complete
 passing pages from the identical interaction engine/browser configuration and
