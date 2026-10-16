@@ -97,11 +97,23 @@ test('never reports incomplete or missing device coverage as success', async () 
   const page = initial(url, 'desktop-chromium');
   page.actions.push({ key:'interrupted', selector:'#a', label:'interrupted', href:'', status:'running', clicks:0 });
   writeFileSync(join(root, 'results', 'partial.json'), JSON.stringify(page));
-  const { summary } = generateReport({ resultsDir:join(root,'results'), manifestDir:join(root,'manifest'), outputDir:join(root,'report') });
+  const { summary } = generateReport({ resultsDir:join(root,'results'), manifestDir:join(root,'manifest'), outputDir:join(root,'report'), sites:[{key:'fixture',name:'Fixture',baseUrl:base}] });
   expect(summary.overall).toBe('failed');
   expect(summary.complete).toBe(false);
   expect(summary.groups.find(g => g.device === 'mobile-chromium')!.missingPages).toEqual([url]);
+  expect(summary.errors.every(e => e.category === 'qa_coverage' && e.causeZh && e.priority === 'P1')).toBe(true);
   expect(readFileSync(join(root,'report','click-audit.txt'),'utf8')).toContain('interrupted');
+});
+
+test('never reports success when a required site inventory is missing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'qa-missing-inventory-'));
+  const { summary, markdown } = generateReport({ resultsDir:join(root,'results'), manifestDir:join(root,'missing'), outputDir:join(root,'report') });
+  expect(summary.overall).toBe('failed');
+  expect(summary.complete).toBe(false);
+  expect(summary.groups).toHaveLength(6);
+  expect(summary.errors).toHaveLength(6);
+  expect(summary.errors.every(e => e.code === 'INVENTORY_NOT_AVAILABLE' && e.category === 'qa_coverage')).toBe(true);
+  expect(markdown).toContain('未知');
 });
 
 test('preserves three-second production pacing and bounds inventory URLs', async () => {
