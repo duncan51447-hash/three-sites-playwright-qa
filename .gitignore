@@ -1,0 +1,10 @@
+node_modules/
+.gh-config/
+.tools/
+playwright-report/
+test-results/
+blob-report/
+qa-manifest/
+qa-results/
+qa-report/
+downloaded-results/

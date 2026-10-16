@@ -1,0 +1,23 @@
+name: QA Engine Regression
+on:
+  push:
+    branches: [main, fix/resumable-human-qa]
+  workflow_dispatch:
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium --only-shell
+      - run: npm run test:engine
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: engine-failure-evidence
+          path: test-results/

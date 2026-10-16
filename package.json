@@ -5,9 +5,12 @@
   "description": "Daily Playwright QA for pl168.net, jf1688.com.tw, and firstloan.tw",
   "scripts": {
     "test": "playwright test",
+    "prepare:qa": "node scripts/prepare-qa.mjs",
+    "test:engine": "playwright test -c playwright.engine.config.ts",
+    "report:qa": "node scripts/report-qa.mjs --gate",
     "report": "playwright show-report"
   },
   "devDependencies": {
-    "@playwright/test": "^1.55.0"
+    "@playwright/test": "1.55.0"
   }
 }

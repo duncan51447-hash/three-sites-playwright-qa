@@ -8,110 +8,129 @@ on:
         required: true
         default: full
         type: choice
-        options:
-          - full
-          - smoke
+        options: [full, smoke]
+      resume_run_id:
+        description: Optional same-version run ID; resume incomplete pages from its combined artifact
+        required: false
+        type: string
   schedule:
-    # 06:00 Asia/Taipei = 22:00 UTC on the previous day
     - cron: '0 22 * * *'
-  push:
-    branches: [main]
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  group: three-sites-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  smoke-qa:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'smoke')
+  inventory:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
+    outputs:
+      matrix: ${{ steps.inventory.outputs.matrix }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Run desktop and mobile QA
-        run: npx playwright test
+          cache: npm
+      - run: npm ci
+      - name: Build fixed public-page inventory
+        id: inventory
+        run: npm run prepare:qa
         env:
-          TZ: Asia/Taipei
-          QA_SCOPE: smoke
-
-      - name: Upload Playwright report
+          QA_SCOPE: ${{ inputs.scope || 'full' }}
+      - name: Upload inventory even when discovery is incomplete
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-smoke-report-${{ github.run_number }}
+          name: qa-manifest
+          path: qa-manifest/
+          retention-days: 30
+
+  browser-qa:
+    needs: inventory
+    if: ${{ !cancelled() && needs.inventory.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix: ${{ fromJSON(needs.inventory.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium --only-shell
+      - uses: actions/download-artifact@v4
+        with:
+          name: qa-manifest
+          path: qa-manifest
+      - name: Restore completed pages when explicitly resuming
+        if: ${{ inputs.resume_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: qa-combined-results
+          path: resume-results
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - name: Run independent page and click tests
+        run: npx playwright test --project="${{ matrix.project }}"
+        env:
+          TZ: Asia/Taipei
+          QA_SITE: ${{ matrix.site }}
+          QA_PROJECT: ${{ matrix.project }}
+          QA_SHARD_INDEX: ${{ matrix.shard }}
+          QA_SHARD_TOTAL: ${{ matrix.shards }}
+          QA_RESUME_DIR: ${{ inputs.resume_run_id != '' && 'resume-results/qa-results' || '' }}
+          QA_WORKERS: '2'
+      - name: Upload per-page checkpoints even on timeout
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results-${{ matrix.site }}-${{ matrix.project }}-${{ matrix.shard }}
           path: |
+            qa-results/
+            qa-report/
             playwright-report/
             test-results/
           retention-days: 30
 
-  full-qa:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
+  report:
+    if: always()
+    needs: [inventory, browser-qa]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { site: pl168, project: desktop-chromium, shard: 0, shards: 2 }
-          - { site: pl168, project: desktop-chromium, shard: 1, shards: 2 }
-          - { site: pl168, project: mobile-chromium, shard: 0, shards: 2 }
-          - { site: pl168, project: mobile-chromium, shard: 1, shards: 2 }
-          - { site: jf1688, project: desktop-chromium, shard: 0, shards: 4 }
-          - { site: jf1688, project: desktop-chromium, shard: 1, shards: 4 }
-          - { site: jf1688, project: desktop-chromium, shard: 2, shards: 4 }
-          - { site: jf1688, project: desktop-chromium, shard: 3, shards: 4 }
-          - { site: jf1688, project: mobile-chromium, shard: 0, shards: 4 }
-          - { site: jf1688, project: mobile-chromium, shard: 1, shards: 4 }
-          - { site: jf1688, project: mobile-chromium, shard: 2, shards: 4 }
-          - { site: jf1688, project: mobile-chromium, shard: 3, shards: 4 }
-          - { site: firstloan, project: desktop-chromium, shard: 0, shards: 2 }
-          - { site: firstloan, project: desktop-chromium, shard: 1, shards: 2 }
-          - { site: firstloan, project: mobile-chromium, shard: 0, shards: 2 }
-          - { site: firstloan, project: mobile-chromium, shard: 1, shards: 2 }
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Run full clickable QA shard
-        run: npx playwright test --project="${{ matrix.project }}"
-        env:
-          TZ: Asia/Taipei
-          QA_SCOPE: full
-          QA_SITE: ${{ matrix.site }}
-          QA_SHARD_INDEX: ${{ matrix.shard }}
-          QA_SHARD_TOTAL: ${{ matrix.shards }}
-
-      - name: Upload shard report
+      - uses: actions/download-artifact@v4
+        with:
+          name: qa-manifest
+          path: qa-manifest
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qa-results-*
+          path: downloaded-results
+      - name: Combine raw checkpoints without losing page identities
+        run: node scripts/combine-qa.mjs
+      - name: Generate Chinese report and fail on missing coverage
+        id: report
+        run: npm run report:qa
+      - name: Upload complete raw data and Chinese report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-full-${{ matrix.site }}-${{ matrix.project }}-${{ matrix.shard }}-${{ github.run_number }}
+          name: qa-combined-results
           path: |
-            playwright-report/
-            test-results/
+            qa-results/
+            qa-manifest/
+            qa-report/
           retention-days: 30
