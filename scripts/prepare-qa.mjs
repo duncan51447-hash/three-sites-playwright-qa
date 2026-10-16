@@ -103,7 +103,7 @@ try {
 const include = inventories.flatMap(site => {
   const shards = scope === 'smoke' ? 1 : Math.max(1, Math.min(40, Math.ceil(site.urls.length / 25)));
   return PROJECTS.flatMap(project => Array.from({ length: shards }, (_, shard) => ({ site: site.key, project, shard, shards })));
-});
+}).sort((a,b) => a.shard - b.shard || a.site.localeCompare(b.site) || a.project.localeCompare(b.project));
 const matrix = JSON.stringify({ include });
 writeFileSync(`${directory}/matrix.json`, matrix);
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${matrix}\n`);

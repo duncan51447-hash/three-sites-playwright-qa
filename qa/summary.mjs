@@ -42,6 +42,7 @@ export function generateReport({ resultsDir = 'qa-results', manifestDir = 'qa-ma
         unverifiedActions: notClicked.length, physicalClicks: actual.reduce((n, page) => n + page.physicalClicks, 0),
         findingCount: actual.reduce((n, page) => n + page.findings.length, 0),
         warningCount: actual.reduce((n, page) => n + page.warnings.length, 0), unplannedUrls: unknown,
+        warningOccurrences: actual.reduce((n, page) => n + page.warnings.reduce((m, warning) => m + (warning.occurrences || 1), 0), 0),
         complete: manifest.complete && !missing.length && !incomplete.length && !unknown.length,
         result: ''
       };
@@ -63,8 +64,8 @@ export function generateReport({ resultsDir = 'qa-results', manifestDir = 'qa-ma
   writeFileSync(join(outputDir, 'coverage-summary.json'), JSON.stringify(summary, null, 2));
   writeFileSync(join(outputDir, 'unplanned-urls.json'), JSON.stringify(unplanned, null, 2));
   writeFileSync(join(outputDir, 'qa-errors.txt'), errors.map(e => `${e.site} | ${e.device} | ${e.code} | ${e.pageUrl} | ${e.resourceUrl || ''} | ${e.message}`).join('\n') || 'No website/coverage errors found.');
-  writeFileSync(join(outputDir, 'qa-warnings.txt'), warnings.map(e => `QA_WARNING | ${e.site} | ${e.device} | ${e.code} | ${e.pageUrl} | ${e.resourceUrl || ''} | ${e.message}`).join('\n') || 'No QA_WARNING.');
-  writeFileSync(join(outputDir, 'click-audit.txt'), [...pages.values()].flatMap(page => page.actions.map(action => `${page.site} | ${page.device} | ${page.url} | ${action.status} | ${action.clicks} clicks | ${action.label} | ${action.href} | ${action.reason || action.evidence || action.destination || ''}`)).join('\n'));
+  writeFileSync(join(outputDir, 'qa-warnings.txt'), warnings.map(e => `QA_WARNING | ${e.site} | ${e.device} | ${e.code} | ${e.pageUrl} | ${e.resourceUrl || ''} | ${e.message} | occurrences=${e.occurrences || 1}`).join('\n') || 'No QA_WARNING.');
+  writeFileSync(join(outputDir, 'click-audit.txt'), [...pages.values()].flatMap(page => page.actions.map(action => `${page.site} | ${page.device} | ${page.url} | ${action.status} | ${action.clicks} target clicks + ${action.setupClicks || 0} setup clicks | ${action.label} | ${action.href} | ${action.reason || action.evidence || action.destination || ''}`)).join('\n'));
   const markdown = [
     `# 三站 QA：${summary.overall === 'passed' ? '成功' : '失敗'}（覆蓋${summary.complete ? '完整' : '未完成'}）`, '',
     '| 網站 | 裝置 | 結果 | 完成／預定頁數 | 已點／發現控制項 | 實際點擊次數 | 互動限定 | 排除 | 未驗證 |',

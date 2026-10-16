@@ -3,14 +3,15 @@ import { mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { publicUrl, STEP_DELAY_MS } from './config.mjs';
 
-export type Finding = { code: string; message: string; pageUrl: string; resourceUrl?: string; observedUrl?: string; severity: string };
-export type Target = { key: string; path: string; href: string; tag: string; type: string; label: string; disabled: boolean };
+export type Finding = { code: string; message: string; pageUrl: string; resourceUrl?: string; observedUrl?: string; severity: string; occurrences?: number };
+export type Target = { key: string; path: string; href: string; tag: string; type: string; label: string; disabled: boolean; occurrence?: number };
 type Revealer = { target: Target; kind: 'click' | 'hover' };
 type Work = { target: Target; revealers: Revealer[] };
 export type Action = {
   key: string; selector: string; label: string; href: string;
   status: 'pending' | 'running' | 'clicked' | 'interaction_only' | 'failed' | 'excluded';
   reason?: string; clicks: number; startedAt?: string; finishedAt?: string;
+  setupClicks?: number;
   destination?: string; evidence?: string;
 };
 export type PageResult = {
@@ -21,6 +22,7 @@ export type PageResult = {
   scopeLimitations: string[]; title?: string; httpStatus?: number; currentAction?: string;
   commit?: string;
   scroll?: { step: number; y: number; height: number; total: number };
+  cachedAssetResponses?: number;
 };
 
 export function atomicJson(path: string, value: unknown) {
@@ -53,6 +55,7 @@ export async function discover(page: Page): Promise<Target[]> {
       return parts.join(' > ');
     };
     const result: Target[] = [];
+    const counts = new Map<string,number>();
     for (const element of elements as HTMLElement[]) {
       const box = element.getBoundingClientRect();
       if (!box.width || !box.height || element.closest('[hidden],[inert],[aria-hidden="true"]')) continue;
@@ -75,7 +78,11 @@ export async function discover(page: Page): Promise<Target[]> {
       const name = text(element.getAttribute('name'));
       const label = text(aria || element.getAttribute('title') || (element as HTMLInputElement).placeholder || (element as HTMLInputElement).value || element.innerText || element.textContent || element.querySelector('img')?.alt || href || tag);
       const css = path(element);
+      const fingerprint = JSON.stringify([tag, href, type, aria, name, label]);
+      const occurrence = counts.get(fingerprint) || 0;
+      counts.set(fingerprint, occurrence + 1);
       result.push({ key: JSON.stringify([css, href, type, aria, name]), path: css, href, tag, type, label,
+        occurrence,
         disabled: element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true' });
     }
     return result;
@@ -87,6 +94,29 @@ const sameDocument = (a: string, b: string) => {
 };
 const loginUrl = (url: string) => /\/(?:wbadmin|wp-admin|wp-login\.php|login|sign-?in)(?:[/?#]|$)/i.test(url);
 
+async function locateTarget(page: Page, target: Target) {
+  const matches = (element: Element, expected: Target) => {
+    const text = (s: string | null | undefined) => (s || '').trim().replace(/\s+/g, ' ').slice(0,160);
+    const href = element instanceof HTMLAnchorElement ? element.href : element instanceof HTMLIFrameElement ? element.src : '';
+    const canonical = (value: string) => {
+      try { const u = new URL(value); return `${u.protocol}//${u.hostname.replace(/^www\./,'')}${u.port ? ':' + u.port : ''}${u.pathname.replace(/\/$/,'')}${u.search}${u.hash}`; } catch { return value; }
+    };
+    const label = text(element.getAttribute('aria-label') || element.getAttribute('title') || (element as HTMLInputElement).placeholder || (element as HTMLInputElement).value || (element as HTMLElement).innerText || element.textContent || element.querySelector('img')?.alt || href || element.tagName.toLowerCase());
+    return element.tagName.toLowerCase() === expected.tag && text(element.getAttribute('type')).toLowerCase() === expected.type && canonical(href) === canonical(expected.href) && label === expected.label;
+  };
+  const direct = page.locator(target.path).first();
+  if (await direct.count() && await direct.evaluate(matches, target).catch(() => false)) return direct;
+  const candidates = page.locator(selector);
+  const count = await candidates.count();
+  const matching: number[] = [];
+  for (let index = 0; index < count; index++) {
+    const candidate = candidates.nth(index);
+    if (await candidate.evaluate(matches,target).catch(() => false) && await candidate.isVisible()) matching.push(index);
+  }
+  const selected = matching.length === 1 ? matching[0] : matching[target.occurrence || 0];
+  return selected === undefined ? direct : candidates.nth(selected);
+}
+
 export async function auditPage(page: Page, result: PageResult, outputPath: string, options: { delay?: number; screenshotDirectory?: string } = {}) {
   const pace = new Pacer(options.delay ?? STEP_DELAY_MS);
   const mobile = result.device.includes('mobile');
@@ -94,18 +124,29 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   const context = page.context();
   const work: Work[] = [];
   const known = new Set<string>();
-  const seenFindings = new Set<string>();
+  const seenFindings = new Map<string, Finding>();
   const mainResponses = new Map<string, number>();
+  const assets = new Map<string, { body: Buffer; headers: Record<string,string>; expires: number }>();
+  let cachedBytes = 0;
+  const assetKey = (request: any) => JSON.stringify([request.url(), request.headers().origin || '', request.headers().accept || '']);
   let active: Action | undefined;
+  let performingSetup = false;
   let intentionalCleanup = false;
   let hovered = false;
   let cdp: CDPSession | undefined;
+  let screenshots = 0;
+  const extraSessions: CDPSession[] = [];
   const save = () => atomicJson(outputPath, result);
   const add = (warning: boolean, code: string, message: string, resourceUrl?: string, observedUrl?: string) => {
-    const key = JSON.stringify([warning, code, message, resourceUrl]);
-    if (seenFindings.has(key)) return;
-    seenFindings.add(key);
-    const finding = { code, message, resourceUrl, observedUrl, pageUrl: source, severity: warning ? 'low' : 'high' };
+    let identity = resourceUrl;
+    if (warning && resourceUrl) {
+      try { const u = new URL(resourceUrl); identity = `${u.origin}${u.pathname}${u.searchParams.has('k') ? '?k=' + u.searchParams.get('k') : ''}`; } catch {}
+    }
+    const key = JSON.stringify([warning, code, message, identity]);
+    const existing = seenFindings.get(key);
+    if (existing) { existing.occurrences = (existing.occurrences || 1) + 1; save(); return; }
+    const finding = { code, message, resourceUrl, observedUrl, pageUrl: source, severity: warning ? 'low' : /BROKEN_IMAGE|HORIZONTAL_OVERFLOW/.test(code) ? 'medium' : 'high', occurrences: 1 };
+    seenFindings.set(key, finding);
     (warning ? result.warnings : result.findings).push(finding);
     console.log(`${warning ? 'QA_WARNING' : 'QA_ERROR'} | ${code} | ${source} | ${resourceUrl || ''} | ${message.replace(/\n/g, ' ').slice(0, 600)}`);
     save();
@@ -117,7 +158,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     observedPage.on('console', message => {
       const text = message.text();
       if (/requestStorageAccess.*Permission denied/i.test(text)) add(true, 'STORAGE_ACCESS', text, message.location().url, observedPage.url());
-      else if (/report-only.*Content Security Policy|Content Security Policy.*report-only/i.test(text)) add(true, 'CSP_REPORT_ONLY', text, message.location().url, observedPage.url());
+      else if (/\[report\s+only\]|report[ -]+only.*Content Security Policy|Content Security Policy.*report[ -]+only/i.test(text)) add(true, 'CSP_REPORT_ONLY', text, message.location().url, observedPage.url());
       else if (/compute-pressure.*not allowed|permissions policy.*compute-pressure/i.test(text)) add(true, 'PERMISSIONS_POLICY', text, message.location().url, observedPage.url());
       else if (message.type() === 'error' && !/Failed to load resource|net::ERR_ABORTED|third-party cookie/i.test(text)) add(!localResource(observedPage.url()), 'CONSOLE_ERROR', text, message.location().url, observedPage.url());
     });
@@ -128,8 +169,41 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
       void chooser.setFiles([]);
     });
   };
-  const onNewPage = (opened: Page) => observe(opened);
+  const observeHandoffs = async (observedPage: Page) => {
+    const session = await context.newCDPSession(observedPage);
+    session.on('Page.frameRequestedNavigation', event => {
+      if (active && !performingSetup && /(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)|^(?:tel|mailto|sms|intent|line|fb-messenger|whatsapp|skype|tg|viber|facetime):/i.test(active.href) && /^(?:tel|mailto|sms|intent|line|fb-messenger|whatsapp|skype|tg|viber|facetime):/i.test(event.url)) {
+        active.status = 'interaction_only'; active.destination = event.url;
+        active.evidence = `External app handoff observed: ${event.url}`; save();
+      }
+    });
+    await session.send('Page.enable');
+    extraSessions.push(session);
+    return session;
+  };
+  const onNewPage = (opened: Page) => { observe(opened); void observeHandoffs(opened).catch(() => {}); };
   const onResponse = (response: any) => {
+    // Routing disables Chromium's HTTP cache. Reuse only live bytes fetched
+    // during this page audit and explicitly cacheable under server headers.
+    // HTML, APIs, POSTs, errors and private/no-cache responses are never cached.
+    const request = response.request();
+    if (response.status() === 200 && ['script','stylesheet','image','font'].includes(request.resourceType())) {
+      const headers = response.headers(), key = assetKey(request);
+      const control = headers['cache-control'] || '';
+      const ttl = Number(control.match(/(?:^|,)\s*max-age=(\d+)/i)?.[1] || 0) - Number(headers.age || 0);
+      if (ttl > 0 && !/no-store|no-cache|private/i.test(control) && !/cookie|\*/i.test(headers.vary || '') && !assets.has(key)) {
+        void response.body().then((body: Buffer) => {
+          if (body.length > 4 * 1024 * 1024 || assets.has(key)) return;
+          while (cachedBytes + body.length > 48 * 1024 * 1024 && assets.size) {
+            const first = assets.keys().next().value!;
+            cachedBytes -= assets.get(first)!.body.length; assets.delete(first);
+          }
+          const cachedHeaders = { ...headers };
+          delete cachedHeaders['content-encoding']; delete cachedHeaders['content-length'];
+          assets.set(key, { body, headers: cachedHeaders, expires: Date.now() + ttl * 1000 }); cachedBytes += body.length;
+        }).catch(() => {});
+      }
+    }
     try { if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) mainResponses.set(response.url(), response.status()); } catch {}
     if (response.status() < 400) return;
     let observedUrl: string | undefined;
@@ -146,7 +220,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   context.on('response', onResponse);
   context.on('requestfailed', onFailed);
   await context.exposeBinding('__qaHandoff', (_event, href: string) => {
-    if (active) { active.evidence = `Trusted browser action observed; outgoing handoff/submission prevented: ${href}`; active.status = 'interaction_only'; save(); }
+    if (active && !performingSetup && (href === active.href || href.startsWith('FORM '))) { active.evidence = `Trusted browser action observed; outgoing handoff/submission prevented: ${href}`; active.status = 'interaction_only'; save(); }
   });
   // Browser instrumentation preserves the trusted click but prevents a real
   // telephone/mail application from being launched. Website source is untouched.
@@ -174,13 +248,23 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     const permittedTelemetry = /(?:^|\.)(?:google\.com|googleapis\.com|gstatic\.com|google-analytics\.com|googletagmanager\.com|doubleclick\.net|youtube\.com|tiktok\.com|tiktokw\.us|facebook\.com)$/.test(u.hostname);
     const cacheHandshake = localResource(url) && /\/wp-content\/plugins\/litespeed-cache\/guest\.vary\.php$/.test(u.pathname);
     if (loginUrl(url) || (mutating && !permittedTelemetry && !cacheHandshake) || /[?&](?:action|rating|vote|logout|add-to-cart)=/i.test(url)) {
-      if (active && (localResource(url) || request.isNavigationRequest())) { active.status = 'interaction_only'; active.evidence = `Outgoing request blocked: ${request.method()} ${url}`; save(); }
+      if (active && !performingSetup && (localResource(url) || request.isNavigationRequest())) { active.status = 'interaction_only'; active.evidence = `Outgoing request blocked: ${request.method()} ${url}`; save(); }
       add(true, 'SIDE_EFFECT_BLOCKED', `${request.method()} prevented by read-only QA`, url);
       return route.abort('blockedbyclient');
+    }
+    if (request.method() === 'GET' && ['script','stylesheet','image','font'].includes(request.resourceType())) {
+      const key = assetKey(request), cached = assets.get(key);
+      if (cached && cached.expires > Date.now()) {
+        result.cachedAssetResponses = (result.cachedAssetResponses || 0) + 1;
+        return route.fulfill({ status: 200, headers: cached.headers, body: cached.body });
+      }
+      if (cached) { cachedBytes -= cached.body.length; assets.delete(key); }
     }
     return route.continue();
   };
   await context.route('**/*', guard);
+  const primarySession = await observeHandoffs(page);
+  if (mobile) cdp = primarySession;
   const navigate = async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -203,15 +287,19 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     if (box && viewport && box.y >= 80 && box.y + box.height <= viewport.height - 70) return;
     await pace.step(() => control.scrollIntoViewIfNeeded({ timeout: 5000 }));
   };
-  const click = async (control: Locator, background = false) => {
+  const click = async (control: Locator, background = false, belongsToActive = true) => {
     await scrollControl(control);
     await control.click({ trial: true, timeout: 4000 });
-    await pace.step(() => mobile && !background ? control.tap({ timeout: 6000 }) : control.click({ timeout: 6000, modifiers: background ? ['Control'] : [], noWaitAfter: true }));
+    const previousSetup = performingSetup;
+    performingSetup = !belongsToActive;
+    try { await pace.step(() => mobile && !background ? control.tap({ timeout: 6000 }) : control.click({ timeout: 6000, modifiers: background ? ['Control'] : [], noWaitAfter: true })); }
+    finally { performingSetup = previousSetup; }
     result.physicalClicks++;
-    if (active) active.clicks++;
+    if (active) { if (belongsToActive) active.clicks++; else active.setupClicks = (active.setupClicks || 0) + 1; }
     save();
   };
   const reset = async () => {
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
     intentionalCleanup = true;
     for (const opened of context.pages()) if (opened !== page) await opened.close().catch(() => {});
     intentionalCleanup = false;
@@ -219,10 +307,21 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     if (!sameDocument(page.url(), source)) await navigate();
     for (const value of ['.mfp-wrap .mfp-close', '.avia-popup .mfp-close', '[role="dialog"] button[aria-label*="Close"]', '.av-burger-overlay-active .av-burger-menu-main a', '.av-burger-overlay .av-burger-overlay-close', '#speak-box-close']) {
       const close = page.locator(value).first();
-      if (await close.isVisible().catch(() => false)) await click(close).catch(() => {});
+      if (await close.isVisible().catch(() => false)) await click(close, false, false).catch(() => {});
     }
     if (await page.locator('.mfp-wrap:visible,[role="dialog"]:visible').count()) await pace.step(() => page.keyboard.press('Escape'));
     if (hovered) { await pace.step(() => page.mouse.move(1, 1)); hovered = false; }
+    if (!sameDocument(page.url(), source)) await navigate();
+  };
+  const settledDiscovery = async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { return sameDocument(source,page.url()) ? await discover(page) : []; }
+      catch (error) {
+        if (!/Execution context was destroyed|frame was detached|Cannot find context/i.test(String(error)) || attempt) throw error;
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+      }
+    }
+    return [];
   };
   const enqueue = (targets: Target[], revealers: Revealer[]) => {
     for (const target of targets) {
@@ -237,9 +336,10 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     save();
   };
   const captureFailure = async (name: string) => {
-    if (!options.screenshotDirectory || page.isClosed()) return;
+    if (!options.screenshotDirectory || page.isClosed() || screenshots >= 2) return;
+    screenshots++;
     mkdirSync(options.screenshotDirectory, { recursive: true });
-    await page.screenshot({ path: `${options.screenshotDirectory}/${name}.png`, timeout: 5000 }).catch(() => {});
+    await page.screenshot({ path: `${options.screenshotDirectory}/${name}.jpg`, type: 'jpeg', quality: 65, timeout: 5000 }).catch(() => {});
   };
   save();
   try {
@@ -254,7 +354,6 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     await page.locator('body').waitFor({ state: 'visible', timeout: 10000 });
     enqueue(await discover(page), []);
     await reset();
-    if (mobile) cdp = await context.newCDPSession(page);
     let reachedBottom = false;
     let stagnantScrolls = 0;
     for (let index = 0; index < 150; index++) {
@@ -307,13 +406,16 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await reset();
-          if (attempt || revealers.length) await pace.step(() => page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 }));
+          // Reloading #toggle-id-N makes Enfold reopen that accordion on startup.
+          // Replay always navigates to the original fragment-free source URL.
+          if (attempt || revealers.length) await navigate();
+          enqueue(await settledDiscovery(), []);
           for (const revealer of revealers) {
-            const control = page.locator(revealer.target.path).first();
+            const control = await locateTarget(page, revealer.target);
             if (revealer.kind === 'hover') { await pace.step(() => control.hover({ timeout: 4000 })); hovered = true; }
-            else await click(control);
+            else await click(control, false, false);
           }
-          const control = page.locator(target.path).first();
+          const control = await locateTarget(page, target);
           await control.waitFor({ state: 'visible', timeout: 4000 });
           if (!mobile && await control.evaluate(e => !!e.closest('nav,.menu,.avia-menu'))) {
             await scrollControl(control);
@@ -322,20 +424,36 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             enqueue(await discover(page), [...revealers, { target, kind: 'hover' }]);
           }
           const before = page.url(), pagesBefore = new Set(context.pages());
-          const isLink = target.tag === 'a' && /^https?:/i.test(target.href);
+          const uiHint = await control.evaluate(element => element.hasAttribute('aria-expanded') || !!element.closest('.menu-item-search,.av-burger-menu-main,.togglecontainer,.av-image-lightbox') || /[?&]s=(?:$|&)/.test((element as HTMLAnchorElement).href || '') || /\.(?:jpe?g|png|gif|webp|avif)(?:\?|$)/i.test((element as HTMLAnchorElement).href || ''));
+          const isLink = target.tag === 'a' && /^https?:/i.test(target.href) && !uiHint;
+          const beforeKeys = new Set((await settledDiscovery()).map(item => item.key));
           await click(control, isLink && !mobile && !sameDocument(before, target.href));
-          await page.waitForTimeout(350);
+          await page.waitForTimeout(options.delay === 0 ? 100 : STEP_DELAY_MS);
           let opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
           const modal = async () => !!await page.locator('.mfp-wrap:visible,[role="dialog"]:visible').count();
-          if (isLink && !mobile && !opened.length && sameDocument(before, page.url()) && !sameDocument(before, target.href) && !await modal()) {
-            await click(control); await page.waitForTimeout(350);
+          if (isLink && !opened.length && !sameDocument(before,target.href) && sameDocument(before,page.url()) && active.status !== 'interaction_only' && !/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
+            await page.waitForURL(url => !sameDocument(before,url.href), { timeout: 8000, waitUntil: 'domcontentloaded' }).catch(() => {});
             opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
+          }
+          if (!sameDocument(before,page.url())) await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+          let revealed = await settledDiscovery();
+          let uiChanged = revealed.some(item => !beforeKeys.has(item.key));
+          if (isLink && !mobile && !opened.length && sameDocument(before, page.url()) && !sameDocument(before, target.href) && !await modal() && !uiChanged) {
+            await click(control); await page.waitForTimeout(options.delay === 0 ? 100 : STEP_DELAY_MS);
+            opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
+            revealed = await settledDiscovery();
+            uiChanged = revealed.some(item => !beforeKeys.has(item.key));
           }
           for (const popup of opened) {
             await popup.waitForURL(url => url.href !== 'about:blank', { timeout: 12000 }).catch(() => {});
             await popup.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
             active.destination = popup.url();
-            if (popup.url() === 'about:blank') throw new Error('New tab never navigated');
+            if (popup.url() === 'about:blank' && active.status !== 'interaction_only') {
+              if (/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
+                active.status = 'interaction_only'; active.evidence = 'Messaging app handoff left an empty browser tab; native app unavailable';
+                add(true, 'EXTERNAL_HANDOFF_UNCONFIRMED', active.evidence, target.href);
+              } else throw new Error('New tab never navigated');
+            }
           }
           if (!opened.length) active.destination = page.url();
           if (target.tag === 'iframe') {
@@ -358,11 +476,19 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
               active.status = 'interaction_only'; active.evidence = 'Embedded frame received a trusted pointer gesture; external service not submitted';
             }
           }
-          if (isLink && !sameDocument(before, target.href) && !opened.length && sameDocument(before, page.url()) && active.status !== 'interaction_only' && !await modal()) throw new Error(`Click produced no navigation or dialog: ${target.href}`);
-          if (sameDocument(source, page.url()) && (!isLink || sameDocument(before, target.href) || await modal())) {
-            const revealed = await discover(page);
+          if (isLink && !sameDocument(before, target.href) && !opened.length && sameDocument(before, page.url()) && active.status !== 'interaction_only' && !await modal() && !uiChanged) {
+            if (/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
+              active.status = 'interaction_only'; active.evidence = 'Trusted messaging-link click; native app handoff unavailable in this browser';
+              add(true, 'EXTERNAL_HANDOFF_UNCONFIRMED', active.evidence, target.href);
+            } else throw new Error(`Click produced no navigation or dialog: ${target.href}`);
+          }
+          const canReveal = !target.href || sameDocument(before,target.href) || uiHint || await modal();
+          if (sameDocument(source, page.url()) && canReveal && active.status !== 'interaction_only') {
+            revealed = revealed.filter(item => !beforeKeys.has(item.key));
             if (revealers.length >= 6 && revealed.some(item => !known.has(item.key))) add(false, 'REVEAL_DEPTH_LIMIT', `Unexplored controls after ${target.label}`, source);
             else enqueue(revealed, [...revealers, { target, kind: 'click' }]);
+          } else if (sameDocument(source,page.url()) && !revealers.length) {
+            enqueue(revealed, []);
           }
           if (['input', 'textarea'].includes(target.tag) && !['button','submit','reset','checkbox','radio','file','image','range','color','date','time'].includes(target.type)) {
             const value = target.type === 'email' ? 'qa@example.invalid' : target.type === 'number' ? '1' : 'QA測試';
@@ -402,6 +528,6 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     result.status = result.complete ? (result.findings.length ? 'failed' : 'passed') : 'incomplete'; save();
     context.off('page', onNewPage); context.off('response', onResponse); context.off('requestfailed', onFailed);
     await context.unroute('**/*', guard).catch(() => {});
-    await cdp?.detach().catch(() => {});
+    for (const session of extraSessions) await session.detach().catch(() => {});
   }
 }

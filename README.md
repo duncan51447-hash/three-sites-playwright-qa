@@ -30,6 +30,12 @@ submenus, accordions, slides and lightboxes without recursively adding all
 existing links. Revealed-control replay and a failed action's one retry start
 from a clean document. Failed actions are saved and testing continues.
 
+Each page audit starts with a fresh context and live resources. While clicking
+within that page, a bounded asset cache honors the live server's public max-age
+headers, restoring ordinary visitor caching that request interception disables.
+Documents, APIs, errors, private/no-cache resources and submissions are never
+served from this cache. Cache contents do not carry over to another page test.
+
 Telephone/mail handoffs and outgoing form/message/voting requests are prevented
 in the test browser. Those controls are physically clicked and separately marked
 `interaction_only`, rather than claiming a backend submission or native app

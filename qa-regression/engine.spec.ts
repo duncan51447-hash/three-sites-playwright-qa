@@ -11,16 +11,18 @@ import { publicUrl, htmlLinks, STEP_DELAY_MS } from '../qa/config.mjs';
 function initial(url: string, device: string): PageResult {
   return { schemaVersion: 1, site: 'Fixture', siteKey: 'fixture', device, url, status: 'running', complete: false, startedAt: new Date().toISOString(), stepDelayMs: 0, actions: [], physicalClicks: 0, findings: [], warnings: [], discoveredUrls: [], scopeLimitations: [] };
 }
-let server: Server, base: string, posts = 0;
+let server: Server, base: string, posts = 0, assetRequests = 0, landings = 0;
 test.beforeAll(async () => {
   server = createServer((request, response) => {
     if (request.method === 'POST') posts++;
+    if (request.url === '/asset.js') { assetRequests++; response.writeHead(200, { 'content-type':'application/javascript', 'cache-control':'public,max-age=3600' }); response.end('window.liveAsset=true;'); return; }
     if (request.url === '/bad.png') { response.writeHead(404); response.end('missing'); return; }
     if (request.url === '/warning.png') { response.writeHead(401); response.end('unauthorized'); return; }
     response.setHeader('content-type', 'text/html');
     if (request.url === '/player/') { response.end('<title>Player</title><button style="position:fixed;inset:0" onclick="this.textContent=\'Playing\'">Play</button>'); return; }
-    if (request.url !== '/') { response.end('<title>Destination</title><main>destination loaded</main>'); return; }
-    response.end(`<!doctype html><title>QA fixture</title>
+    if (request.url !== '/') { response.end('<title>Destination</title><script src="/asset.js"></script><main>destination loaded</main>'); return; }
+    const section = `footer-${landings++ % 2}`;
+    response.end(`<!doctype html><title>QA fixture</title><script src="/asset.js"></script>
       <style>body{margin:0;padding:25px}a,button,input,select{display:block;margin:15px;padding:8px}#panel{display:none}.av-burger-overlay-active #panel{display:block}.mfp-wrap{display:none;position:fixed;inset:0;background:#eee;z-index:20}.mfp-wrap.open{display:block}#speak-box-close{display:none}</style>
       <nav class="av-burger-menu-main"><a id="menu" href="#" onclick="document.body.classList.toggle('av-burger-overlay-active');return false">Menu</a></nav>
       <div id="panel"><a id="child" href="/child/">Hidden child</a><button id="nested" onclick="document.getElementById('deep').hidden=false">Nested</button><a id="deep" href="/deep/" hidden>Deep child</a></div>
@@ -28,6 +30,9 @@ test.beforeAll(async () => {
       <a id="same1" href="/same/">same label</a><a id="same2" href="/same/">same label</a>
       <a id="popup" href="/popup/" target="_blank">Popup</a>
       <a id="phone" href="tel:0800000000">Phone</a>
+      <a id="search" href="/?s=" onclick="document.getElementById('query').hidden=false;return false">Search</a><input id="query" placeholder="Search query" hidden>
+      <a id="faq" href="#toggle-id-10" onclick="const p=document.getElementById('answer');p.hidden=!p.hidden;this.href=p.hidden?'#toggle-id-10':'#toggle-id-10-closed';location.hash=p.hidden?'toggle-id-10-closed':'toggle-id-10';return false">FAQ</a>
+      <div id="answer" hidden><a id="faq-child" href="/faq-destination/">FAQ child</a></div>
       <button id="photo" onclick="document.getElementById('modal').classList.add('open')">Photo</button>
       <div id="modal" class="mfp-wrap"><button class="mfp-close" id="close" onclick="document.getElementById('modal').classList.remove('open')">Close photo</button></div>
       <form><input id="name" name="name" placeholder="Name" required><button id="submit" type="submit">Submit</button></form>
@@ -35,8 +40,9 @@ test.beforeAll(async () => {
       <div id="play-overlay" class="av-click-to-play-overlay" style="cursor:pointer;padding:20px" onclick="document.getElementById('player').hidden=false">Embedded play overlay</div>
       <iframe id="player" title="Embedded player" src="/player/" hidden></iframe>
       <a id="login" href="/wp-login.php">Login</a>
+      <div id="${section}"><a href="/stable-footer/">Stable footer</a></div>
       <div style="height:1000px">scroll content</div><button id="bottom">Bottom button</button>
-      <script>document.addEventListener('click',e=>{window.counts ||= {};if(e.isTrusted&&e.target.id)window.counts[e.target.id]=(window.counts[e.target.id]||0)+1},true)</script>`);
+      <script>if(location.hash.startsWith('#toggle-id-10')){document.getElementById('answer').hidden=false;document.getElementById('faq').href='#toggle-id-10-closed';}console.error('[Report Only] Refused to frame https://www.google.com/ because frame-ancestors is report-only');document.addEventListener('click',e=>{window.counts ||= {};if(e.isTrusted&&e.target.id)window.counts[e.target.id]=(window.counts[e.target.id]||0)+1},true)</script>`);
   });
   await new Promise<void>(resolve => server.listen(0, '0.0.0.0', resolve));
   base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -47,10 +53,11 @@ test('physically clicks duplicate links, hidden menus, lightbox, touch and form 
   const result = initial(`${base}/`, info.project.name);
   const path = info.outputPath('page.json');
   const beforePosts = posts;
+  const beforeAssets = assetRequests;
   await auditPage(page, result, path, { delay: 0 });
   expect(result.complete, JSON.stringify(result.findings)).toBe(true);
   expect(result.findings).toEqual([]);
-  for (const id of ['menu','child','nested','deep','ordinary','same1','same2','popup','phone','photo','close','name','submit','post','bottom','play-overlay','player']) {
+  for (const id of ['menu','child','nested','deep','ordinary','same1','same2','popup','phone','photo','close','name','submit','post','bottom','play-overlay','player','search','query','faq','faq-child']) {
     const action = result.actions.find(action => action.selector === `#${id}`);
     expect(action, `Missing ${id}`).toBeTruthy();
     expect(action!.clicks, `${id}: ${action!.reason}`).toBeGreaterThan(0);
@@ -58,7 +65,11 @@ test('physically clicks duplicate links, hidden menus, lightbox, touch and form 
   }
   expect(result.actions.find(a => a.selector === '#phone')?.status).toBe('interaction_only');
   expect(result.actions.find(a => a.selector === '#login')?.status).toBe('excluded');
+  expect(result.actions.filter(a => a.label === 'Stable footer').every(a => a.status === 'clicked')).toBe(true);
+  expect(result.warnings.some(w => w.code === 'CSP_REPORT_ONLY')).toBe(true);
   expect(posts).toBe(beforePosts);
+  expect(assetRequests - beforeAssets, 'Fetch each live cacheable asset once per page audit').toBe(1);
+  expect(result.cachedAssetResponses).toBeGreaterThan(1);
   const saved = JSON.parse(readFileSync(path, 'utf8'));
   expect(saved.actions.length).toBe(result.actions.length);
   expect(saved.physicalClicks).toBeGreaterThanOrEqual(15);
