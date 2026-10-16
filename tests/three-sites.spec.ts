@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { SITES, STEP_DELAY_MS } from '../qa/config.mjs';
+import { ENGINE_VERSION } from '../qa/engine-version.mjs';
 import { auditPage, PageResult, atomicJson } from '../qa/audit';
 
 const requestedSite = process.env.QA_SITE;
@@ -21,14 +22,16 @@ for (const site of sites) {
       const resumePath = process.env.QA_RESUME_DIR && join(process.env.QA_RESUME_DIR, site.key, testInfo.project.name, `${id}.json`);
       if (resumePath && existsSync(resumePath)) {
         const previous = JSON.parse(readFileSync(resumePath, 'utf8'));
-        if (previous.commit === process.env.GITHUB_SHA && previous.status === 'passed' && previous.complete && previous.stepDelayMs === STEP_DELAY_MS) {
+        const fresh = previous.finishedAt && Math.abs(Date.now() - Date.parse(previous.finishedAt)) <= 24 * 3600000;
+        if (previous.engineVersion === ENGINE_VERSION && fresh && previous.status === 'passed' && previous.complete && previous.stepDelayMs === STEP_DELAY_MS && previous.findings?.length === 0 && previous.actions?.every(action => ['clicked','interaction_only','excluded'].includes(action.status))) {
           atomicJson(path, previous);
-          test.skip(true, 'Reused complete passing page from the identical commit and pacing');
+          test.skip(true, 'Reused fresh passing evidence from the identical interaction engine/browser/pacing');
         }
       }
       const result: PageResult = {
         schemaVersion: 1, site: site.name, siteKey: site.key, device: testInfo.project.name, url,
         commit: process.env.GITHUB_SHA,
+        engineVersion: ENGINE_VERSION,
         status: 'running', complete: false, startedAt: new Date().toISOString(), stepDelayMs: STEP_DELAY_MS,
         actions: [], physicalClicks: 0, findings: [], warnings: [], discoveredUrls: [],
         scopeLimitations: ['No login', 'No real telephone call or outgoing form/message submission', 'Chromium desktop and emulated mobile; native iOS Safari not included']

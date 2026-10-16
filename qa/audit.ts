@@ -21,6 +21,7 @@ export type PageResult = {
   findings: Finding[]; warnings: Finding[]; discoveredUrls: string[];
   scopeLimitations: string[]; title?: string; httpStatus?: number; currentAction?: string;
   commit?: string;
+  engineVersion?: string;
   scroll?: { step: number; y: number; height: number; total: number };
   cachedAssetResponses?: number;
 };
@@ -126,6 +127,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   const known = new Set<string>();
   const seenFindings = new Map<string, Finding>();
   const mainResponses = new Map<string, number>();
+  let navigationResponses = 0;
   const assets = new Map<string, { body: Buffer; headers: Record<string,string>; expires: number }>();
   let cachedBytes = 0;
   const assetKey = (request: any) => JSON.stringify([request.url(), request.headers().origin || '', request.headers().accept || '']);
@@ -204,7 +206,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
         }).catch(() => {});
       }
     }
-    try { if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) mainResponses.set(response.url(), response.status()); } catch {}
+    try { if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) { mainResponses.set(response.url(), response.status()); navigationResponses++; } } catch {}
     if (response.status() < 400) return;
     let observedUrl: string | undefined;
     try { observedUrl = response.request().frame().url(); } catch {}
@@ -424,6 +426,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             enqueue(await discover(page), [...revealers, { target, kind: 'hover' }]);
           }
           const before = page.url(), pagesBefore = new Set(context.pages());
+          const navigationBefore = navigationResponses;
           const uiHint = await control.evaluate(element => element.hasAttribute('aria-expanded') || !!element.closest('.menu-item-search,.av-burger-menu-main,.togglecontainer,.av-image-lightbox') || /[?&]s=(?:$|&)/.test((element as HTMLAnchorElement).href || '') || /\.(?:jpe?g|png|gif|webp|avif)(?:\?|$)/i.test((element as HTMLAnchorElement).href || ''));
           const isLink = target.tag === 'a' && /^https?:/i.test(target.href) && !uiHint;
           const beforeKeys = new Set((await settledDiscovery()).map(item => item.key));
@@ -431,14 +434,16 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
           await page.waitForTimeout(options.delay === 0 ? 100 : STEP_DELAY_MS);
           let opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
           const modal = async () => !!await page.locator('.mfp-wrap:visible,[role="dialog"]:visible').count();
-          if (isLink && !opened.length && !sameDocument(before,target.href) && sameDocument(before,page.url()) && active.status !== 'interaction_only' && !/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
+          let revealed = await settledDiscovery();
+          let uiChanged = revealed.some(item => !beforeKeys.has(item.key));
+          if (isLink && !opened.length && !sameDocument(before,target.href) && sameDocument(before,page.url()) && navigationResponses === navigationBefore && !uiChanged && active.status !== 'interaction_only' && !/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
             await page.waitForURL(url => !sameDocument(before,url.href), { timeout: 8000, waitUntil: 'domcontentloaded' }).catch(() => {});
             opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
           }
           if (!sameDocument(before,page.url())) await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-          let revealed = await settledDiscovery();
-          let uiChanged = revealed.some(item => !beforeKeys.has(item.key));
-          if (isLink && !mobile && !opened.length && sameDocument(before, page.url()) && !sameDocument(before, target.href) && !await modal() && !uiChanged) {
+          revealed = await settledDiscovery();
+          uiChanged = revealed.some(item => !beforeKeys.has(item.key));
+          if (isLink && !mobile && !opened.length && sameDocument(before, page.url()) && !sameDocument(before, target.href) && navigationResponses === navigationBefore && !await modal() && !uiChanged) {
             await click(control); await page.waitForTimeout(options.delay === 0 ? 100 : STEP_DELAY_MS);
             opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
             revealed = await settledDiscovery();
@@ -476,13 +481,14 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
               active.status = 'interaction_only'; active.evidence = 'Embedded frame received a trusted pointer gesture; external service not submitted';
             }
           }
-          if (isLink && !sameDocument(before, target.href) && !opened.length && sameDocument(before, page.url()) && active.status !== 'interaction_only' && !await modal() && !uiChanged) {
+          if (isLink && !sameDocument(before, target.href) && !opened.length && sameDocument(before, page.url()) && navigationResponses === navigationBefore && active.status !== 'interaction_only' && !await modal() && !uiChanged) {
             if (/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
               active.status = 'interaction_only'; active.evidence = 'Trusted messaging-link click; native app handoff unavailable in this browser';
               add(true, 'EXTERNAL_HANDOFF_UNCONFIRMED', active.evidence, target.href);
             } else throw new Error(`Click produced no navigation or dialog: ${target.href}`);
           }
-          const canReveal = !target.href || sameDocument(before,target.href) || uiHint || await modal();
+          if (navigationResponses > navigationBefore && !active.evidence) active.evidence = 'Main document navigation confirmed, including redirects back to the canonical URL';
+          const canReveal = !target.href || sameDocument(before,target.href) || uiHint || await modal() || (uiChanged && navigationResponses === navigationBefore);
           if (sameDocument(source, page.url()) && canReveal && active.status !== 'interaction_only') {
             revealed = revealed.filter(item => !beforeKeys.has(item.key));
             if (revealers.length >= 6 && revealed.some(item => !known.has(item.key))) add(false, 'REVEAL_DEPTH_LIMIT', `Unexplored controls after ${target.label}`, source);

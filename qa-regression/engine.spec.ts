@@ -15,6 +15,7 @@ let server: Server, base: string, posts = 0, assetRequests = 0, landings = 0;
 test.beforeAll(async () => {
   server = createServer((request, response) => {
     if (request.method === 'POST') posts++;
+    if (request.url === '/canonical-home/') { response.writeHead(302,{location:'/'}); response.end(); return; }
     if (request.url === '/asset.js') { assetRequests++; response.writeHead(200, { 'content-type':'application/javascript', 'cache-control':'public,max-age=3600' }); response.end('window.liveAsset=true;'); return; }
     if (request.url === '/bad.png') { response.writeHead(404); response.end('missing'); return; }
     if (request.url === '/warning.png') { response.writeHead(401); response.end('unauthorized'); return; }
@@ -27,6 +28,8 @@ test.beforeAll(async () => {
       <nav class="av-burger-menu-main"><a id="menu" href="#" onclick="document.body.classList.toggle('av-burger-overlay-active');return false">Menu</a></nav>
       <div id="panel"><a id="child" href="/child/">Hidden child</a><button id="nested" onclick="document.getElementById('deep').hidden=false">Nested</button><a id="deep" href="/deep/" hidden>Deep child</a></div>
       <a id="ordinary" href="/destination/">Ordinary link</a>
+      <a id="alias" href="/canonical-home/">Canonical home alias</a>
+      <a id="web-menu-parent" href="/section/" onclick="document.getElementById('web-menu-child').hidden=false;return false">URL-shaped menu opener</a><a id="web-menu-child" href="/web-child/" hidden>URL-shaped menu child</a>
       <a id="same1" href="/same/">same label</a><a id="same2" href="/same/">same label</a>
       <a id="popup" href="/popup/" target="_blank">Popup</a>
       <a id="phone" href="tel:0800000000">Phone</a>
@@ -57,7 +60,7 @@ test('physically clicks duplicate links, hidden menus, lightbox, touch and form 
   await auditPage(page, result, path, { delay: 0 });
   expect(result.complete, JSON.stringify(result.findings)).toBe(true);
   expect(result.findings).toEqual([]);
-  for (const id of ['menu','child','nested','deep','ordinary','same1','same2','popup','phone','photo','close','name','submit','post','bottom','play-overlay','player','search','query','faq','faq-child']) {
+  for (const id of ['menu','child','nested','deep','ordinary','alias','web-menu-parent','web-menu-child','same1','same2','popup','phone','photo','close','name','submit','post','bottom','play-overlay','player','search','query','faq','faq-child']) {
     const action = result.actions.find(action => action.selector === `#${id}`);
     expect(action, `Missing ${id}`).toBeTruthy();
     expect(action!.clicks, `${id}: ${action!.reason}`).toBeGreaterThan(0);

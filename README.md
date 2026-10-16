@@ -65,7 +65,8 @@ CSP and third-party resource failures remain `QA_WARNING`. Script-order errors
 such as `jQuery is not defined` are not suppressed.
 
 An interrupted run may be dispatched again with `resume_run_id`. Only complete
-passing pages from the identical commit and three-second pacing are reused;
+passing pages from the identical interaction engine/browser configuration and
+three-second pacing are reused for up to 24 hours (original commit/time retained);
 failed, missing and interrupted pages are rerun. Browser tests have no action or
 page sampling limit. A 45-minute per-page or 5.5-hour runner timeout remains an
 explicit incomplete failure with retained checkpoints, never a silent pass.
