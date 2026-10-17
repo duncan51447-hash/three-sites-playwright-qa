@@ -94,6 +94,7 @@ const sameDocument = (a: string, b: string) => {
   try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname && x.search === y.search; } catch { return false; }
 };
 const loginUrl = (url: string) => /\/(?:wbadmin|wp-admin|wp-login\.php|login|sign-?in)(?:[/?#]|$)/i.test(url);
+class BrowserVerificationBlocked extends Error {}
 
 async function locateTarget(page: Page, target: Target) {
   const matches = (element: Element, expected: Target) => {
@@ -270,10 +271,16 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   const navigate = async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
-      try { return await pace.step(() => page.goto(source, { waitUntil: 'domcontentloaded', timeout: 30000 })); }
+      try {
+        const response = await pace.step(() => page.goto(source, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        await assertPublicContent(page);
+        return response;
+      }
       catch (error) {
+        if (error instanceof BrowserVerificationBlocked) throw error;
         lastError = error;
         const usable = await page.evaluate(() => document.readyState !== 'loading' && !!document.body?.innerText.trim()).catch(() => false);
+        if (usable) await assertPublicContent(page);
         const status = mainResponses.get(page.url());
         if (sameDocument(page.url(), source) && usable && status && status < 400) {
           add(true, 'LOAD_EVENT_TIMEOUT', 'Document rendered; load-event wait timed out. All browser interactions still tested.', source);
@@ -302,6 +309,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
   };
   const reset = async () => {
     await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+    await assertPublicContent(page);
     intentionalCleanup = true;
     for (const opened of context.pages()) if (opened !== page) await opened.close().catch(() => {});
     intentionalCleanup = false;
@@ -337,11 +345,25 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     }
     save();
   };
-  const captureFailure = async (name: string) => {
-    if (!options.screenshotDirectory || page.isClosed() || screenshots >= 2) return;
+  const captureFailure = async (name: string, observedPage = page) => {
+    if (!options.screenshotDirectory || observedPage.isClosed() || screenshots >= 2) return;
     screenshots++;
     mkdirSync(options.screenshotDirectory, { recursive: true });
-    await page.screenshot({ path: `${options.screenshotDirectory}/${name}.jpg`, type: 'jpeg', quality: 65, timeout: 5000 }).catch(() => {});
+    await observedPage.screenshot({ path: `${options.screenshotDirectory}/${name}.jpg`, type: 'jpeg', quality: 65, timeout: 5000 }).catch(() => {});
+  };
+  const assertPublicContent = async (observedPage: Page) => {
+    if (observedPage.isClosed() || !localResource(observedPage.url())) return;
+    const document = await observedPage.locator('body').evaluate(body => ({ title: body.ownerDocument.title, text: (body as HTMLElement).innerText.trim().replace(/\s+/g, ' ') }));
+    if (observedPage === page && sameDocument(source, observedPage.url())) result.title = document.title;
+    const verificationTitle = /^(?:one moment,?\s*(?:please)?|just a moment|checking your browser)[.!…\s]*$/i.test(document.title);
+    const verificationText = /please wait while your request is being verified|verify (?:that )?you are human|checking your browser/i.test(document.text);
+    if (!verificationTitle || !verificationText || document.text.length > 2000) return;
+    const message = `${document.title} | ${document.text.slice(0, 300)} | Public content unavailable to this test browser; verification was not bypassed or retried`;
+    result.complete = false;
+    result.scopeLimitations.push(message);
+    add(false, 'BROWSER_VERIFICATION_BLOCKED', message, observedPage.url(), observedPage.url());
+    await captureFailure('browser-verification-blocked', observedPage);
+    throw new BrowserVerificationBlocked(message);
   };
   save();
   try {
@@ -354,6 +376,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     }
     if (!result.title.trim()) add(false, 'EMPTY_TITLE', 'Page title is empty', source);
     await page.locator('body').waitFor({ state: 'visible', timeout: 10000 });
+    await assertPublicContent(page);
     enqueue(await discover(page), []);
     await reset();
     let reachedBottom = false;
@@ -443,10 +466,12 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
           }
           if (!sameDocument(before,page.url())) await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+          await assertPublicContent(page);
           revealed = await settledDiscovery();
           uiChanged = revealed.some(item => !beforeKeys.has(item.key));
           if (isLink && !mobile && !opened.length && sameDocument(before, page.url()) && !sameDocument(before, target.href) && navigationResponses === navigationBefore && !await modal() && !uiChanged) {
             await click(control); await page.waitForTimeout(options.delay === 0 ? 100 : STEP_DELAY_MS);
+            await assertPublicContent(page);
             opened = context.pages().filter(candidate => !pagesBefore.has(candidate));
             revealed = await settledDiscovery();
             uiChanged = revealed.some(item => !beforeKeys.has(item.key));
@@ -455,6 +480,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             await popup.waitForURL(url => url.href !== 'about:blank', { timeout: 12000 }).catch(() => {});
             await popup.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
             active.destination = popup.url();
+            await assertPublicContent(popup);
             if (popup.url() === 'about:blank' && active.status !== 'interaction_only') {
               if (/(?:m\.me|messenger\.com|line\.me|lin\.ee|wa\.me)/i.test(target.href)) {
                 active.status = 'interaction_only'; active.evidence = 'Messaging app handoff left an empty browser tab; native app unavailable';
@@ -515,6 +541,10 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
           if (active.status === 'running') active.status = 'clicked';
           active.finishedAt = new Date().toISOString(); save(); break;
         } catch (error) {
+          if (error instanceof BrowserVerificationBlocked) {
+            active.status = 'failed'; active.reason = String(error); active.finishedAt = new Date().toISOString();
+            throw error;
+          }
           if (attempt === 0 && !page.isClosed()) continue;
           active.status = 'failed'; active.reason = String(error); active.finishedAt = new Date().toISOString();
           add(false, 'INTERACTION_FAILED', `${target.label} | ${String(error)}`, target.href || source, page.url());
@@ -529,8 +559,10 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
     }
     result.complete = reachedBottom && !result.actions.some(action => ['pending', 'running'].includes(action.status));
   } catch (error) {
-    add(false, 'PAGE_AUDIT_INTERRUPTED', String(error), source, page.url());
-    await captureFailure('interrupted');
+    if (!(error instanceof BrowserVerificationBlocked)) {
+      add(false, 'PAGE_AUDIT_INTERRUPTED', String(error), source, page.url());
+      await captureFailure('interrupted');
+    }
   } finally {
     result.finishedAt = new Date().toISOString();
     result.status = result.complete ? (result.findings.length ? 'failed' : 'passed') : 'incomplete'; save();

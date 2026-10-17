@@ -5,7 +5,9 @@ import { PROJECTS, SITES } from './config.mjs';
 function explain(item, warning = false) {
   const code = item.code || '';
   let category = 'website', causeZh = '網站回應或前端執行發生錯誤，請依原始訊息與資源網址定位。', priority = item.severity === 'medium' ? 'P2' : 'P1';
-  if (/^(?:PAGE_NOT_RUN|PAGE_INCOMPLETE|PAGE_AUDIT_INTERRUPTED|INVENTORY_|TEST_|REVEAL_DEPTH_LIMIT)/.test(code)) {
+  if (code === 'BROWSER_VERIFICATION_BLOCKED') {
+    category = 'qa_coverage'; causeZh = '測試瀏覽器停在網站驗證頁，未進入公開內容；這是測試覆蓋受阻，不能據此判定網站對一般訪客故障。'; priority = 'P1';
+  } else if (/^(?:PAGE_NOT_RUN|PAGE_INCOMPLETE|PAGE_AUDIT_INTERRUPTED|INVENTORY_|TEST_|REVEAL_DEPTH_LIMIT)/.test(code)) {
     category = 'qa_coverage'; causeZh = '測試證據或覆蓋尚未完成；此項本身不能判定網站故障。'; priority = 'P1';
   } else if (code === 'INTERACTION_FAILED') {
     category = 'needs_review'; causeZh = '實際互動重試後仍無法完成；需依點擊、頁面與截圖確認是網站行為或測試定位問題。';

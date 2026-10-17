@@ -11,7 +11,7 @@ import { publicUrl, htmlLinks, STEP_DELAY_MS } from '../qa/config.mjs';
 function initial(url: string, device: string): PageResult {
   return { schemaVersion: 1, site: 'Fixture', siteKey: 'fixture', device, url, status: 'running', complete: false, startedAt: new Date().toISOString(), stepDelayMs: 0, actions: [], physicalClicks: 0, findings: [], warnings: [], discoveredUrls: [], scopeLimitations: [] };
 }
-let server: Server, base: string, posts = 0, assetRequests = 0, landings = 0;
+let server: Server, base: string, posts = 0, assetRequests = 0, landings = 0, verificationVisits = 0;
 test.beforeAll(async () => {
   server = createServer((request, response) => {
     if (request.method === 'POST') posts++;
@@ -20,6 +20,19 @@ test.beforeAll(async () => {
     if (request.url === '/bad.png') { response.writeHead(404); response.end('missing'); return; }
     if (request.url === '/warning.png') { response.writeHead(401); response.end('unauthorized'); return; }
     response.setHeader('content-type', 'text/html');
+    if (request.url === '/browser-verification/') {
+      verificationVisits++;
+      response.end('<title>One moment, please...</title><p>Please wait while your request is being verified...</p>'); return;
+    }
+    if (request.url === '/challenge-link/') {
+      response.end('<title>Public article</title><a id="blocked-child" href="/browser-verification/">Read more</a><button id="later-control">Later control</button>'); return;
+    }
+    if (request.url === '/verification-title-only/') {
+      response.end('<title>One moment, please...</title><main>Ordinary public content<button id="ordinary-control">Continue reading</button></main>'); return;
+    }
+    if (request.url === '/verification-quote-only/') {
+      response.end('<title>Verification help article</title><article><p>The message says: Please wait while your request is being verified...</p><button id="ordinary-control">Continue reading</button></article>'); return;
+    }
     if (request.url === '/player/') { response.end('<title>Player</title><button style="position:fixed;inset:0" onclick="this.textContent=\'Playing\'">Play</button>'); return; }
     if (request.url !== '/') { response.end('<title>Destination</title><script src="/asset.js"></script><main>destination loaded</main>'); return; }
     const section = `footer-${landings++ % 2}`;
@@ -88,6 +101,58 @@ test('records same-site HTTP failure separately from third-party 401', async ({ 
   expect(result.warnings.some(f => f.code === 'HTTP_401_RESOURCE')).toBe(true);
   expect(result.status).toBe('failed');
 });
+
+test('keeps a browser verification page outside completed public-page coverage', async ({ page }, info) => {
+  const url = `${base}/browser-verification/`;
+  const result = initial(url, info.project.name);
+  const path = info.outputPath('page.json');
+  const before = verificationVisits;
+  await auditPage(page, result, path, { delay: 0 });
+  expect(result.complete).toBe(false);
+  expect(result.status).toBe('incomplete');
+  expect(result.physicalClicks).toBe(0);
+  expect(result.actions).toEqual([]);
+  expect(verificationVisits - before, 'Do not retry a recognized verification block').toBe(1);
+  expect(result.findings.map(f => f.code)).toContain('BROWSER_VERIFICATION_BLOCKED');
+  expect(result.findings.some(f => f.code === 'NO_CLICKABLE_CONTROLS')).toBe(false);
+  expect(JSON.parse(readFileSync(path, 'utf8')).complete).toBe(false);
+
+  const root = mkdtempSync(join(tmpdir(), 'qa-blocked-coverage-'));
+  mkdirSync(join(root, 'manifest'));
+  writeFileSync(join(root, 'manifest', 'fixture.json'), JSON.stringify({ key:'fixture', name:'Fixture', baseUrl:base, urls:[url], complete:true, errors:[] }));
+  const { summary } = generateReport({ resultsDir:info.outputDir, manifestDir:join(root,'manifest'), outputDir:join(root,'report'), project:info.project.name, sites:[{key:'fixture',name:'Fixture',baseUrl:base}] });
+  expect(summary.overall).toBe('failed');
+  expect(summary.complete).toBe(false);
+  expect(summary.groups[0].completedPages).toBe(0);
+  expect(summary.groups[0].incompletePages).toEqual([url]);
+  const block = summary.errors.find(e => e.code === 'BROWSER_VERIFICATION_BLOCKED');
+  expect(block?.category).toBe('qa_coverage');
+  expect(block?.causeZh).toContain('驗證頁');
+});
+
+test('stops after a trusted link opens a verification block without clicking later controls', async ({ page }, info) => {
+  const result = initial(`${base}/challenge-link/`, info.project.name);
+  const before = verificationVisits;
+  await auditPage(page, result, info.outputPath('page.json'), { delay: 0 });
+  expect(result.complete).toBe(false);
+  expect(result.status).toBe('incomplete');
+  expect(result.physicalClicks).toBe(1);
+  expect(verificationVisits - before).toBe(1);
+  expect(result.actions.find(a => a.selector === '#blocked-child')?.clicks).toBe(1);
+  expect(result.actions.find(a => a.selector === '#later-control')?.status).toBe('pending');
+  expect(result.actions.find(a => a.selector === '#later-control')?.clicks).toBe(0);
+  expect(result.findings.some(f => f.code === 'BROWSER_VERIFICATION_BLOCKED' && f.observedUrl === `${base}/browser-verification/`)).toBe(true);
+});
+
+for (const path of ['verification-title-only', 'verification-quote-only']) {
+  test(`does not mistake an ordinary page for a block: ${path}`, async ({ page }, info) => {
+    const result = initial(`${base}/${path}/`, info.project.name);
+    await auditPage(page, result, info.outputPath(`${path}.json`), { delay: 0 });
+    expect(result.complete, JSON.stringify(result.findings)).toBe(true);
+    expect(result.findings).toEqual([]);
+    expect(result.actions.find(a => a.selector === '#ordinary-control')?.clicks).toBe(1);
+  });
+}
 
 test('never reports incomplete or missing device coverage as success', async () => {
   const root = mkdtempSync(join(tmpdir(), 'qa-report-regression-'));

@@ -70,6 +70,12 @@ image, empty title or horizontal overflow. Storage-access warnings, report-only
 CSP and third-party resource failures remain `QA_WARNING`. Script-order errors
 such as `jQuery is not defined` are not suppressed.
 Missing inventory is an incomplete failure for each required site/device.
+Recognized first-party verification pages, such as “One moment, please...” with
+“Please wait while your request is being verified...”, stop that page audit
+without retrying or bypassing the verification. This applies to the initial page
+and destinations opened by trusted clicks, including new tabs. Their saved result
+remains incomplete with `BROWSER_VERIFICATION_BLOCKED`, classified as `qa_coverage`;
+loading a verification screen does not count as testing the public website.
 Chinese explanations and P1/P2/P3 priorities separate website faults, interactions
 requiring review, QA coverage gaps and background warnings. Missing artifacts
 still produce a final coverage report instead of skipping the report job.
