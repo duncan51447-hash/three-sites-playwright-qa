@@ -37,7 +37,7 @@ test.beforeAll(async () => {
       <a id="faq" href="#toggle-id-10" onclick="const p=document.getElementById('answer');p.hidden=!p.hidden;this.href=p.hidden?'#toggle-id-10':'#toggle-id-10-closed';location.hash=p.hidden?'toggle-id-10-closed':'toggle-id-10';return false">FAQ</a>
       <div id="answer" hidden><a id="faq-child" href="/faq-destination/">FAQ child</a></div>
       <button id="photo" onclick="document.getElementById('modal').classList.add('open')">Photo</button>
-      <div id="modal" class="mfp-wrap"><button class="mfp-close" id="close" onclick="document.getElementById('modal').classList.remove('open')">Close photo</button></div>
+      <div id="modal" class="mfp-wrap"><button class="mfp-close" id="close" type="button" onclick="document.getElementById('modal').remove()">Close photo</button></div>
       <form><input id="name" name="name" placeholder="Name" required><button id="submit" type="submit">Submit</button></form>
       <button id="post" onclick="fetch('/submit/',{method:'POST',body:'test'}).catch(()=>{})">Read-only guarded action</button>
       <div id="play-overlay" class="av-click-to-play-overlay" style="cursor:pointer;padding:20px" onclick="document.getElementById('player').hidden=false">Embedded play overlay</div>
@@ -67,6 +67,7 @@ test('physically clicks duplicate links, hidden menus, lightbox, touch and form 
     expect(['clicked','interaction_only']).toContain(action!.status);
   }
   expect(result.actions.find(a => a.selector === '#phone')?.status).toBe('interaction_only');
+  expect(result.actions.find(a => a.selector === '#close')?.clicks).toBe(1);
   expect(result.actions.find(a => a.selector === '#login')?.status).toBe('excluded');
   expect(result.actions.filter(a => a.label === 'Stable footer').every(a => a.status === 'clicked')).toBe(true);
   expect(result.warnings.some(w => w.code === 'CSP_REPORT_ONLY')).toBe(true);
