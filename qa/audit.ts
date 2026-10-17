@@ -419,6 +419,8 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
           }
           const control = await locateTarget(page, target);
           await control.waitFor({ state: 'visible', timeout: 4000 });
+          // Closing a dialog can remove its button; inspect form membership first.
+          const isSubmitControl = target.type === 'submit' || (target.tag === 'button' && await control.evaluate(e => !!e.closest('form')));
           if (!mobile && await control.evaluate(e => !!e.closest('nav,.menu,.avia-menu'))) {
             await scrollControl(control);
             await pace.step(() => control.hover({ timeout: 4000 })); hovered = true;
@@ -506,7 +508,7 @@ export async function auditPage(page: Page, result: PageResult, outputPath: stri
             await pace.step(() => control.press('ArrowDown')); await pace.step(() => control.press('Enter'));
             active.evidence = 'Opened and selected using keyboard';
           }
-          if (target.type === 'submit' || (target.tag === 'button' && await control.evaluate(e => !!e.closest('form')))) {
+          if (isSubmitControl) {
             active.status = 'interaction_only';
             active.evidence ||= 'Submit clicked; client validation inspected; outgoing submission prevented by QA';
           }
